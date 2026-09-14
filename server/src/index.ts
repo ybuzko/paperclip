@@ -108,6 +108,7 @@ import {
   loadWithoutCoordinatedShutdownSignalHooks,
 } from "./shutdown.js";
 import { systemdNotify } from "./services/systemd-notify.js";
+import { getSharedFleetGovernorService } from "./services/fleet/governor-service.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
 import {
   createEmbeddedPostgresSupervisor,
@@ -1073,6 +1074,7 @@ export async function startServer(): Promise<StartedServer> {
   }>) | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  let fleetGovernorStop: (() => void) | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1672,7 +1674,17 @@ export async function startServer(): Promise<StartedServer> {
       });
     }, backupIntervalMs);
   }
-  
+
+  if (!["0", "false"].includes((process.env.PAPERCLIP_FLEET_GOVERNOR_ENABLED ?? "").toLowerCase())) {
+    const fleetGovernor = getSharedFleetGovernorService({ db, logger });
+    const fleetGovernorStatus = await fleetGovernor.getStatus().catch((err) => {
+      logger.error({ err }, "fleet governor: failed to read initial status");
+      return null;
+    });
+    fleetGovernorStop = fleetGovernor.start();
+    logger.info(`Fleet governor started (mode=${fleetGovernorStatus?.mode ?? "shadow"})`);
+  }
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
@@ -1762,6 +1774,10 @@ export async function startServer(): Promise<StartedServer> {
       if (heartbeatSchedulerInterval) {
         clearInterval(heartbeatSchedulerInterval);
         heartbeatSchedulerInterval = null;
+      }
+      if (fleetGovernorStop) {
+        fleetGovernorStop();
+        fleetGovernorStop = null;
       }
 
       const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({

@@ -323,6 +323,7 @@ describe("parseClaudeCliUsageText", () => {
     expect(parseClaudeCliUsageText(raw)).toEqual([
       {
         label: "Current session",
+        key: "five_hour",
         usedPercent: 2,
         resetsAt: null,
         valueLabel: null,
@@ -330,6 +331,7 @@ describe("parseClaudeCliUsageText", () => {
       },
       {
         label: "Current week (all models)",
+        key: "seven_day",
         usedPercent: 47,
         resetsAt: null,
         valueLabel: null,
@@ -337,6 +339,7 @@ describe("parseClaudeCliUsageText", () => {
       },
       {
         label: "Current week (Sonnet only)",
+        key: "seven_day_sonnet",
         usedPercent: 0,
         resetsAt: null,
         valueLabel: null,
@@ -344,6 +347,7 @@ describe("parseClaudeCliUsageText", () => {
       },
       {
         label: "Extra usage",
+        key: "extra_usage",
         usedPercent: null,
         resetsAt: null,
         valueLabel: null,
@@ -607,6 +611,7 @@ describe("fetchClaudeQuota", () => {
     expect(windows).toEqual([
       {
         label: "Extra usage",
+        key: "extra_usage",
         usedPercent: null,
         resetsAt: null,
         valueLabel: "Not enabled",

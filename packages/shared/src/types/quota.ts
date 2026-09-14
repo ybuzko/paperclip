@@ -10,6 +10,14 @@ export interface QuotaWindow {
   valueLabel: string | null;
   /** optional supporting text, e.g. reset details or provider-specific notes */
   detail?: string | null;
+  /**
+   * Stable machine key for this window, e.g. "five_hour", "seven_day",
+   * "seven_day_sonnet", "seven_day_opus", "extra_usage". Unlike `label`
+   * (human-facing, may be reworded), `key` is meant to be matched on by
+   * downstream consumers (e.g. the fleet governor). Optional because not
+   * every provider/window maps cleanly onto a known key.
+   */
+  key?: string;
 }
 
 /** result for one provider from the quota-windows endpoint */

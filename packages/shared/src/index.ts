@@ -1671,6 +1671,11 @@ export {
   type TrustPresetInput,
   type LowTrustBoundaryInput,
   type TrustAuthorizationPolicyInput,
+  governorParamsPatchSchema,
+  governorModeSchema,
+  patchFleetSettingsSchema,
+  type GovernorParamsPatch,
+  type PatchFleetSettings,
 } from "./validators/index.js";
 
 export {

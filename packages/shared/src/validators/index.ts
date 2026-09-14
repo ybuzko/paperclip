@@ -45,6 +45,14 @@ export {
 } from "./instance.js";
 
 export {
+  governorParamsPatchSchema,
+  governorModeSchema,
+  patchFleetSettingsSchema,
+  type GovernorParamsPatch,
+  type PatchFleetSettings,
+} from "./fleet.js";
+
+export {
   upsertBudgetPolicySchema,
   resolveBudgetIncidentSchema,
   type UpsertBudgetPolicy,
