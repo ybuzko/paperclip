@@ -611,6 +611,12 @@ export interface CreateConfigValues {
   runtimeServicesJson?: string;
   defaultEnvironmentId?: string;
   maxTurnsPerRun: number;
+  /**
+   * Optional per-run USD budget cap. Unset/0/negative means no cap. Currently
+   * only threaded through for the claude_local adapter, which passes it to
+   * the Claude Code CLI as `--max-budget-usd`.
+   */
+  maxBudgetUsdPerRun?: number;
   heartbeatEnabled: boolean;
   intervalSec: number;
   /** Arbitrary key-value pairs populated by schema-driven config fields. */

@@ -3,7 +3,21 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
+import type { ProviderQuotaResult } from "@paperclipai/adapter-utils";
+// Use the shared QuotaWindow (which carries the optional stable `key`) for
+// windows built in this module; it structurally satisfies
+// @paperclipai/adapter-utils's QuotaWindow (an extra optional field), so it
+// still fits into ProviderQuotaResult.windows below.
+import type { QuotaWindow } from "@paperclipai/shared";
+
+/** Stable machine key for each Anthropic quota window, keyed by its human label. */
+const CLAUDE_QUOTA_LABEL_TO_KEY: Record<string, string> = {
+  "Current session": "five_hour",
+  "Current week (all models)": "seven_day",
+  "Current week (Sonnet only)": "seven_day_sonnet",
+  "Current week (Opus only)": "seven_day_opus",
+  "Extra usage": "extra_usage",
+};
 
 const execFileAsync = promisify(execFile);
 
@@ -223,6 +237,7 @@ export async function fetchClaudeQuota(token: string): Promise<QuotaWindow[]> {
   if (body.five_hour != null) {
     windows.push({
       label: "Current session",
+      key: CLAUDE_QUOTA_LABEL_TO_KEY["Current session"],
       usedPercent: toPercent(body.five_hour.utilization),
       resetsAt: body.five_hour.resets_at ?? null,
       valueLabel: null,
@@ -232,6 +247,7 @@ export async function fetchClaudeQuota(token: string): Promise<QuotaWindow[]> {
   if (body.seven_day != null) {
     windows.push({
       label: "Current week (all models)",
+      key: CLAUDE_QUOTA_LABEL_TO_KEY["Current week (all models)"],
       usedPercent: toPercent(body.seven_day.utilization),
       resetsAt: body.seven_day.resets_at ?? null,
       valueLabel: null,
@@ -241,6 +257,7 @@ export async function fetchClaudeQuota(token: string): Promise<QuotaWindow[]> {
   if (body.seven_day_sonnet != null) {
     windows.push({
       label: "Current week (Sonnet only)",
+      key: CLAUDE_QUOTA_LABEL_TO_KEY["Current week (Sonnet only)"],
       usedPercent: toPercent(body.seven_day_sonnet.utilization),
       resetsAt: body.seven_day_sonnet.resets_at ?? null,
       valueLabel: null,
@@ -250,6 +267,7 @@ export async function fetchClaudeQuota(token: string): Promise<QuotaWindow[]> {
   if (body.seven_day_opus != null) {
     windows.push({
       label: "Current week (Opus only)",
+      key: CLAUDE_QUOTA_LABEL_TO_KEY["Current week (Opus only)"],
       usedPercent: toPercent(body.seven_day_opus.utilization),
       resetsAt: body.seven_day_opus.resets_at ?? null,
       valueLabel: null,
@@ -259,6 +277,7 @@ export async function fetchClaudeQuota(token: string): Promise<QuotaWindow[]> {
   if (body.extra_usage != null) {
     windows.push({
       label: "Extra usage",
+      key: CLAUDE_QUOTA_LABEL_TO_KEY["Extra usage"],
       usedPercent: body.extra_usage.is_enabled === false ? null : toPercent(body.extra_usage.utilization),
       resetsAt: null,
       valueLabel:
@@ -411,6 +430,7 @@ export function parseClaudeCliUsageText(text: string): QuotaWindow[] {
     const usedPercent = section.lines.map(percentFromLine).find((value) => value != null) ?? null;
     return {
       label: section.label,
+      key: CLAUDE_QUOTA_LABEL_TO_KEY[section.label],
       usedPercent,
       resetsAt: null,
       valueLabel: null,

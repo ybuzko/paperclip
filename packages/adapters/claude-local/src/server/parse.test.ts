@@ -11,6 +11,7 @@ import {
   isClaudeUnknownSessionError,
   isClaudeImageProcessingError,
   isClaudeModelNotFoundError,
+  isClaudeMaxBudgetResult,
 } from "./parse.js";
 
 describe("detectClaudeLoginRequired", () => {
@@ -166,6 +167,31 @@ describe("isClaudeModelNotFoundError", () => {
   });
 });
 
+describe("isClaudeMaxBudgetResult", () => {
+  it("detects the documented error_max_budget_usd subtype", () => {
+    expect(
+      isClaudeMaxBudgetResult({ subtype: "error_max_budget_usd", result: "Budget limit reached" }),
+    ).toBe(true);
+  });
+
+  it("detects the documented budget_exhausted terminal_reason", () => {
+    expect(isClaudeMaxBudgetResult({ terminal_reason: "budget_exhausted" })).toBe(true);
+    expect(isClaudeMaxBudgetResult({ terminalReason: "budget_exhausted" })).toBe(true);
+  });
+
+  it("falls back defensively to any budget-shaped subtype or stop reason", () => {
+    expect(isClaudeMaxBudgetResult({ subtype: "error_max_budget_exceeded" })).toBe(true);
+    expect(isClaudeMaxBudgetResult({ stop_reason: "max_budget_exhausted" })).toBe(true);
+    expect(isClaudeMaxBudgetResult({ stopReason: "some_budget_variant" })).toBe(true);
+  });
+
+  it("does not classify unrelated or missing results as budget exhaustion", () => {
+    expect(isClaudeMaxBudgetResult(null)).toBe(false);
+    expect(isClaudeMaxBudgetResult({ subtype: "success" })).toBe(false);
+    expect(isClaudeMaxBudgetResult({ subtype: "error_max_turns" })).toBe(false);
+  });
+});
+
 describe("isClaudeTransientUpstreamError", () => {
   it("classifies the 'out of extra usage' subscription window failure as provider quota", () => {
     expect(
@@ -261,6 +287,14 @@ describe("isClaudeTransientUpstreamError", () => {
           result: "No conversation found with session id abc-123",
           errors: [{ message: "No conversation found with session id abc-123" }],
         },
+      }),
+    ).toBe(false);
+  });
+
+  it("does not classify max-budget exhaustion as transient", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: { subtype: "error_max_budget_usd", result: "Budget limit reached" },
       }),
     ).toBe(false);
   });

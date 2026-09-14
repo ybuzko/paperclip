@@ -289,6 +289,36 @@ export function isClaudeMaxTurnsResult(parsed: Record<string, unknown> | null | 
   );
 }
 
+// Confirmed against the Claude Code Agent SDK's `SDKResultMessage` type
+// (https://code.claude.com/docs/en/agent-sdk/typescript, "SDKResultMessage"):
+// the error arm's `subtype` union includes "error_max_budget_usd", and
+// `terminal_reason` for that arm is documented as "budget_exhausted". Matched
+// case-insensitively and with a loose substring fallback so a future rename
+// of either string still resolves to the cap outcome.
+export function isClaudeMaxBudgetResult(parsed: Record<string, unknown> | null | undefined): boolean {
+  if (!parsed) return false;
+
+  const subtype = asString(parsed.subtype, "").trim().toLowerCase();
+  if (subtype === "error_max_budget_usd") return true;
+  if (subtype.includes("max_budget")) return true;
+
+  const structuredStopReasons = [
+    parsed.stop_reason,
+    parsed.stopReason,
+    parsed.terminal_reason,
+    parsed.terminalReason,
+    parsed.error_code,
+    parsed.errorCode,
+  ].map((value) => asString(value, "").trim().toLowerCase());
+
+  return structuredStopReasons.some((reason) =>
+    reason === "budget_exhausted" ||
+    reason === "max_budget" ||
+    reason === "max_budget_exhausted" ||
+    reason.includes("budget"),
+  );
+}
+
 export function isClaudeRefusalResult(parsed: Record<string, unknown> | null | undefined): boolean {
   if (!parsed) return false;
 
@@ -521,7 +551,7 @@ export function isClaudeTransientUpstreamError(input: {
 }): boolean {
   const parsed = input.parsed ?? null;
   // Deterministic failures are handled by their own classifiers.
-  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
+  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeMaxBudgetResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
     return false;
   }
   const loginMeta = detectClaudeLoginRequired({
@@ -544,7 +574,7 @@ export function isClaudeProviderQuotaError(input: {
   errorMessage?: string | null;
 }): boolean {
   const parsed = input.parsed ?? null;
-  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
+  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeMaxBudgetResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
     return false;
   }
   const loginMeta = detectClaudeLoginRequired({

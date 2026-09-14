@@ -66,6 +66,7 @@ import {
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
   isClaudeMaxTurnsResult,
+  isClaudeMaxBudgetResult,
   isClaudeProviderQuotaError,
   isClaudeRefusalResult,
   isClaudeTransientUpstreamError,
@@ -81,7 +82,7 @@ import {
   resolveSharedClaudeConfigDir,
   writePaperclipClaudeMcpConfig,
 } from "./claude-config.js";
-import { claudeCommandSupportsEffortFlag } from "./cli-capabilities.js";
+import { claudeCommandSupportsEffortFlag, claudeCommandSupportsMaxBudgetFlag } from "./cli-capabilities.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
@@ -155,6 +156,14 @@ function isBedrockAuth(env: Record<string, string>): boolean {
     env.CLAUDE_CODE_USE_BEDROCK === "true" ||
     hasNonEmptyEnvValue(env, "ANTHROPIC_BEDROCK_BASE_URL")
   );
+}
+
+// Rounds a USD budget amount to at most 2 decimal places without padding
+// trailing zeros, e.g. 5 -> "5", 5.5 -> "5.5", 5.567 -> "5.57". Uses a
+// round-trip through Math.round to avoid floating-point artifacts such as
+// 5.1 * 100 === 509.99999999999994.
+function formatClaudeMaxBudgetUsdArg(amountUsd: number): string {
+  return String(Math.round(amountUsd * 100) / 100);
 }
 
 function resolveClaudeBillingType(env: Record<string, string>): "api" | "subscription" | "metered_api" {
@@ -397,6 +406,15 @@ export async function runClaudeLogin(input: {
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const engineSelection = await resolveClaudeExecutionEngineForRun(ctx);
+  if (engineSelection.policyRejection) {
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorMessage: engineSelection.policyRejection.reason,
+      errorCode: engineSelection.policyRejection.errorCode,
+    };
+  }
   if (engineSelection.engine === "acp") {
     try {
       return await executeClaudeAcp(ctx);
@@ -429,6 +447,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const effort = asString(config.effort, "");
   const chrome = asBoolean(config.chrome, false);
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
+  const maxBudgetUsdPerRun = asNumber(config.maxBudgetUsdPerRun, 0);
   const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
   const configEnv = parseObject(config.env);
   const workspaceContext = parseObject(context.paperclipWorkspace);
@@ -752,6 +771,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
     }
   }
+  let effectiveMaxBudgetUsd = maxBudgetUsdPerRun > 0 ? maxBudgetUsdPerRun : 0;
+  if (executionTargetIsSandbox && effectiveMaxBudgetUsd > 0) {
+    const supportsMaxBudget = await claudeCommandSupportsMaxBudgetFlag({
+      runId,
+      command,
+      target: runtimeExecutionTarget,
+      cwd,
+      env,
+      timeoutSec,
+      graceSec,
+    });
+    if (supportsMaxBudget === false) {
+      effectiveMaxBudgetUsd = 0;
+      await onLog(
+        "stderr",
+        `[paperclip] Claude CLI in the environment does not advertise --max-budget-usd; omitting configured per-run budget cap of $${maxBudgetUsdPerRun}. Upgrade the environment CLI/image to restore the budget cap.\n`,
+      );
+    }
+  }
 
   const runtimeSessionParams = parseObject(runtime.sessionParams);
   const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
@@ -884,6 +922,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     if (effectiveEffort) args.push("--effort", effectiveEffort);
     if (maxTurns > 0) args.push("--max-turns", String(maxTurns));
+    if (effectiveMaxBudgetUsd > 0) {
+      args.push("--max-budget-usd", formatClaudeMaxBudgetUsdArg(effectiveMaxBudgetUsd));
+    }
     // On resumed sessions the instructions are already in the session cache;
     // re-injecting them via --append-system-prompt-file wastes 5-10K tokens
     // per heartbeat and the Claude CLI may reject the combination outright.
@@ -1106,6 +1147,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       parsedStream.sessionId ??
       (asString(parsed.session_id, opts.fallbackSessionId ?? "") || opts.fallbackSessionId);
     const clearSessionForMaxTurns = isClaudeMaxTurnsResult(parsed);
+    // Mirrors clearSessionForMaxTurns: the CLI's --max-budget-usd cap ends the
+    // run deterministically (SDKResultMessage subtype "error_max_budget_usd",
+    // terminal_reason "budget_exhausted"), so it gets the same non-crash
+    // "stopped by cap" treatment rather than being misclassified as a
+    // transient/provider failure.
+    const clearSessionForMaxBudget = isClaudeMaxBudgetResult(parsed);
     const poisonedPreviousMessageId = isClaudePoisonedPreviousMessageIdError(parsed);
     // Fable 5 policy refusals exit cleanly (exitCode=0, is_error=false), so this
     // is intentionally independent of `failed` — otherwise a refusal looks like a
@@ -1147,6 +1194,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       failed &&
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
+      !clearSessionForMaxBudget &&
       !poisonedPreviousMessageId &&
       isClaudeProviderQuotaError({
         parsed,
@@ -1158,6 +1206,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       failed &&
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
+      !clearSessionForMaxBudget &&
       !poisonedPreviousMessageId &&
       !providerQuota &&
       isClaudeTransientUpstreamError({
@@ -1190,6 +1239,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? "model_not_found"
       : failed && clearSessionForMaxTurns
       ? "max_turns_exhausted"
+      : failed && clearSessionForMaxBudget
+      ? "max_budget_exhausted"
       : failed && poisonedPreviousMessageId
       ? "claude_poisoned_previous_message_id"
       : providerQuota
@@ -1209,6 +1260,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
+      ...(failed && clearSessionForMaxBudget ? { stopReason: "max_budget_exhausted" } : {}),
       ...(failed && poisonedPreviousMessageId ? { stopReason: "claude_poisoned_previous_message_id" } : {}),
       ...(claudeRefusal ? { stopReason: "refusal", errorFamily: "model_refusal" } : {}),
       ...(errorFamily ? { errorFamily } : {}),
@@ -1241,6 +1293,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       summary: parsedStream.summary || asString(parsed.result, ""),
       clearSession:
         clearSessionForMaxTurns ||
+        clearSessionForMaxBudget ||
         // Clear-on-error: a poisoned previous_message_id is a deterministic
         // state error. Force the server to drop persisted session state for
         // this issue so the next continuation starts from a clean slate.

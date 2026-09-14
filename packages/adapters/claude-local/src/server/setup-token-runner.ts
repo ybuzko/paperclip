@@ -10,6 +10,7 @@ import {
   parseSetupTokenPrompt,
   type SetupTokenPrompt,
 } from "./setup-token-parse.js";
+import { isClaudeCliOnlyPolicy } from "./fleet-guard.js";
 
 // The Claude `setup-token` login runner. It starts `claude setup-token` through
 // an injected {@link SetupTokenPtyDriver}, surfaces the sign-in prompt one time
@@ -201,6 +202,16 @@ export async function runSetupTokenLogin(
   driver: SetupTokenPtyDriver,
   options: RunSetupTokenLoginOptions,
 ): Promise<SetupTokenLoginResult> {
+  // Fleet Claude CLI-only policy gate. This deployment's fleet policy allows
+  // only the operator's own, already-authenticated `claude` CLI login to
+  // consume the shared subscription; minting a fresh OAuth token here would
+  // hand out a second, forwardable credential. Refuse before starting the PTY
+  // driver, so no `claude setup-token` process is ever spawned under policy.
+  if (isClaudeCliOnlyPolicy()) {
+    throw new Error(
+      "Setup-token login is disabled: PAPERCLIP_CLAUDE_CLI_ONLY fleet policy is on, so OAuth token minting via `claude setup-token` is not permitted. Only the operator's own `claude` CLI login may be used.",
+    );
+  }
   const { onPrompt, provideCode, onCredential, timeoutMs, signal } = options;
   const command = options.command ?? CLAUDE_SETUP_TOKEN_COMMAND;
   const codeSubmitSettleMs = options.codeSubmitSettleMs ?? CODE_SUBMIT_SETTLE_MS;

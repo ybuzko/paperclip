@@ -62,6 +62,21 @@ describe("buildClaudeLocalConfig", () => {
     });
   });
 
+  it("omits maxBudgetUsdPerRun when unset, zero, or negative", () => {
+    expect(buildClaudeLocalConfig(makeValues({}))).not.toHaveProperty("maxBudgetUsdPerRun");
+    expect(buildClaudeLocalConfig(makeValues({ maxBudgetUsdPerRun: 0 }))).not.toHaveProperty(
+      "maxBudgetUsdPerRun",
+    );
+    expect(buildClaudeLocalConfig(makeValues({ maxBudgetUsdPerRun: -5 }))).not.toHaveProperty(
+      "maxBudgetUsdPerRun",
+    );
+  });
+
+  it("persists a positive maxBudgetUsdPerRun", () => {
+    const config = buildClaudeLocalConfig(makeValues({ maxBudgetUsdPerRun: 12.5 }));
+    expect(config.maxBudgetUsdPerRun).toBe(12.5);
+  });
+
   it("keeps company secret and plain env bindings", () => {
     const config = buildClaudeLocalConfig(
       makeValues({

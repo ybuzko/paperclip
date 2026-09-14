@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SETUP_TOKEN_PROMPT } from "./setup-token-parse.js";
 import {
   CLAUDE_SETUP_TOKEN_COMMAND,
@@ -371,5 +371,43 @@ describe("runSetupTokenLogin", () => {
 
   it("exposes the fixed setup-token command", () => {
     expect(CLAUDE_SETUP_TOKEN_COMMAND).toBe("claude setup-token");
+  });
+
+  describe("under the Claude CLI-only fleet policy", () => {
+    const originalPolicy = process.env.PAPERCLIP_CLAUDE_CLI_ONLY;
+
+    afterEach(() => {
+      if (originalPolicy === undefined) delete process.env.PAPERCLIP_CLAUDE_CLI_ONLY;
+      else process.env.PAPERCLIP_CLAUDE_CLI_ONLY = originalPolicy;
+    });
+
+    it("refuses to start the login and never spawns the PTY driver", async () => {
+      process.env.PAPERCLIP_CLAUDE_CLI_ONLY = "true";
+      const fake = createFakeDriver({ chunks: [PROMPT_OUTPUT, SUCCESS_OUTPUT], exitCode: 0 });
+      const start = vi.spyOn(fake.driver, "start");
+      await expect(
+        runSetupTokenLogin(fake.driver, {
+          onPrompt: () => {},
+          provideCode: async () => BROWSER_CODE,
+          onCredential: async () => {},
+          timeoutMs: 1000,
+        }),
+      ).rejects.toThrow(/PAPERCLIP_CLAUDE_CLI_ONLY/);
+      expect(start).not.toHaveBeenCalled();
+      expect(fake.stops.count).toBe(0);
+      expect(fake.disposes.count).toBe(0);
+    });
+
+    it("still runs normally when the policy is off", async () => {
+      delete process.env.PAPERCLIP_CLAUDE_CLI_ONLY;
+      const fake = createFakeDriver({ chunks: [PROMPT_OUTPUT, SUCCESS_OUTPUT], exitCode: 0 });
+      const result = await runSetupTokenLogin(fake.driver, {
+        onPrompt: () => {},
+        provideCode: async () => BROWSER_CODE,
+        onCredential: async () => {},
+        timeoutMs: 1000,
+      });
+      expect(result.outcome).toBe("success");
+    });
   });
 });

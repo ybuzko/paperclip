@@ -6,12 +6,14 @@ export { listClaudeModels, refreshClaudeModels, resetClaudeModelsCacheForTests }
 export { testEnvironment } from "./test.js";
 export {
   claudeCommandSupportsEffortFlag,
+  claudeCommandSupportsMaxBudgetFlag,
   resetClaudeCliCapabilitiesCacheForTests,
 } from "./cli-capabilities.js";
 export {
   parseClaudeStreamJson,
   describeClaudeFailure,
   isClaudeMaxTurnsResult,
+  isClaudeMaxBudgetResult,
   isClaudeProviderQuotaError,
   isClaudeRefusalResult,
   isClaudeUnknownSessionError,

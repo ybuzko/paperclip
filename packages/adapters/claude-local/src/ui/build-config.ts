@@ -44,6 +44,9 @@ export function buildClaudeLocalConfig(v: CreateConfigValues): Record<string, un
   const env = buildAdapterEnvConfig(v.envBindings, v.envVars);
   if (Object.keys(env).length > 0) ac.env = env;
   ac.maxTurnsPerRun = v.maxTurnsPerRun;
+  if (typeof v.maxBudgetUsdPerRun === "number" && v.maxBudgetUsdPerRun > 0) {
+    ac.maxBudgetUsdPerRun = v.maxBudgetUsdPerRun;
+  }
   ac.dangerouslySkipPermissions = v.dangerouslySkipPermissions;
   if (v.workspaceStrategyType === "git_worktree") {
     ac.workspaceStrategy = {

@@ -54,6 +54,7 @@ import { detectClaudeLoginRequired, parseClaudeStreamJson } from "./parse.js";
 import { buildClaudeProbePermissionArgs } from "./permissions.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "./auth-check.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
+import { evaluateClaudeCliOnlyPolicy, isClaudeCliOnlyPolicy } from "./fleet-guard.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const packageRootDir = path.resolve(moduleDir, "../..");
@@ -65,6 +66,14 @@ export interface ClaudeEngineSelection {
   engine: ClaudeExecutionEngine;
   explicit: boolean;
   fallbackReason?: string;
+  /**
+   * Set when the fleet's Claude CLI-only policy (`PAPERCLIP_CLAUDE_CLI_ONLY`,
+   * see `./fleet-guard.js`) rejects this run's config. `execute()` must
+   * surface this as a failed `AdapterExecutionResult` (using `errorCode` and
+   * `reason`) before starting any process; `engine`/`explicit` carry no
+   * meaning on a rejected selection.
+   */
+  policyRejection?: { reason: string; errorCode: string };
 }
 
 type ClaudeEngineResolutionInput =
@@ -92,6 +101,24 @@ export function resolveClaudeExecutionEngine(config: Record<string, unknown>): C
 export async function resolveClaudeExecutionEngineForRun(
   input: ClaudeEngineResolutionInput,
 ): Promise<ClaudeEngineSelection> {
+  // Fleet Claude CLI-only policy gate. When on, this is the single source of
+  // truth for engine selection: it forces the CLI lane (explicit, so no
+  // fallback-reason log fires) and rejects any config that would otherwise
+  // reach the ACP lane or an alternate auth path. This runs before every other
+  // rule below, including the filesystem/network confinement branch, so a
+  // policy rejection always wins over any other outcome.
+  if (isClaudeCliOnlyPolicy()) {
+    const evaluation = evaluateClaudeCliOnlyPolicy({ config: input.config });
+    if (!evaluation.ok) {
+      return {
+        engine: "cli",
+        explicit: true,
+        policyRejection: { reason: evaluation.reason, errorCode: evaluation.errorCode },
+      };
+    }
+    return { engine: "cli", explicit: true };
+  }
+
   const selection = normalizeEngine(input.config.engine);
   const filesystemScope = parseLocalProcessFilesystemScope(input.config.filesystemScope);
   const networkScope = parseLocalProcessNetworkScope(input.config.networkScope);

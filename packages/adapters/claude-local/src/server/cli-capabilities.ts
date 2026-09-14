@@ -3,6 +3,7 @@ import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/exe
 import path from "node:path";
 
 const effortFlagSupportCache = new Map<string, Promise<boolean | null>>();
+const maxBudgetFlagSupportCache = new Map<string, Promise<boolean | null>>();
 
 export function claudeCommandLooksLike(command: string, expected = "claude"): boolean {
   const base = path.basename(command).toLowerCase();
@@ -33,15 +34,18 @@ function cacheKeyForTarget(command: string, target: AdapterExecutionTarget | nul
   ].join(":");
 }
 
-async function probeClaudeCommandSupportsEffortFlag(input: {
-  runId: string;
-  command: string;
-  target: AdapterExecutionTarget | null | undefined;
-  cwd: string;
-  env: Record<string, string>;
-  timeoutSec: number;
-  graceSec: number;
-}): Promise<boolean | null> {
+async function probeClaudeCommandHelpSupportsFlag(
+  input: {
+    runId: string;
+    command: string;
+    target: AdapterExecutionTarget | null | undefined;
+    cwd: string;
+    env: Record<string, string>;
+    timeoutSec: number;
+    graceSec: number;
+  },
+  flagText: string,
+): Promise<boolean | null> {
   const help = await runAdapterExecutionTargetProcess(
     input.runId,
     input.target,
@@ -58,7 +62,7 @@ async function probeClaudeCommandSupportsEffortFlag(input: {
 
   if (help.timedOut) return null;
   const output = `${help.stdout}\n${help.stderr}`;
-  if (output.includes("--effort")) return true;
+  if (output.includes(flagText)) return true;
   if ((help.exitCode ?? 0) === 0) return false;
   return null;
 }
@@ -81,7 +85,7 @@ export async function claudeCommandSupportsEffortFlag(input: {
   // A thrown probe (e.g. sandbox connection error, ENOENT spawning the binary)
   // must degrade to the conservative fallback rather than killing the run, so we
   // resolve to null and drop the cache entry to retry on the next lease.
-  const probe = probeClaudeCommandSupportsEffortFlag(input).catch(() => {
+  const probe = probeClaudeCommandHelpSupportsFlag(input, "--effort").catch(() => {
     effortFlagSupportCache.delete(key);
     return null;
   });
@@ -89,6 +93,32 @@ export async function claudeCommandSupportsEffortFlag(input: {
   return probe;
 }
 
+export async function claudeCommandSupportsMaxBudgetFlag(input: {
+  runId: string;
+  command: string;
+  target: AdapterExecutionTarget | null | undefined;
+  cwd: string;
+  env: Record<string, string>;
+  timeoutSec: number;
+  graceSec: number;
+}): Promise<boolean | null> {
+  if (!claudeCommandLooksLike(input.command, "claude")) return null;
+
+  const key = cacheKeyForTarget(input.command, input.target);
+  const cached = maxBudgetFlagSupportCache.get(key);
+  if (cached) return cached;
+
+  // See claudeCommandSupportsEffortFlag: degrade a thrown probe to the
+  // conservative fallback instead of killing the run.
+  const probe = probeClaudeCommandHelpSupportsFlag(input, "--max-budget-usd").catch(() => {
+    maxBudgetFlagSupportCache.delete(key);
+    return null;
+  });
+  maxBudgetFlagSupportCache.set(key, probe);
+  return probe;
+}
+
 export function resetClaudeCliCapabilitiesCacheForTests() {
   effortFlagSupportCache.clear();
+  maxBudgetFlagSupportCache.clear();
 }

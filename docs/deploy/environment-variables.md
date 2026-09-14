@@ -118,3 +118,7 @@ These are set automatically by the server when invoking agents:
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic API key (for Claude Code adapter) |
 | `OPENAI_API_KEY` | OpenAI API key (for Codex adapter) |
+
+## Fleet policy
+
+`PAPERCLIP_CLAUDE_CLI_ONLY` (`1`/`true`/`yes`, case-insensitive; unset/anything else means off) locks the `claude_local` adapter to the unmodified `claude` CLI running under the operator's own login, for deployments that run a whole fleet of agents on a single Claude Max subscription. When set, engine resolution forces the Claude CLI lane and never falls back to or defaults into the ACP lane (`@agentclientprotocol/claude-agent-acp`); any run whose adapter config explicitly requests `engine: "acp"`, sets a `managedAiConnection`, injects `CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` via config `env`, or passes `--bare`/`--api-key`/`--auth-token` fails immediately with `errorCode: "claude_cli_only_policy"` before any process is spawned; and `claude setup-token` (OAuth token minting) refuses to start. See `packages/adapters/claude-local/src/server/fleet-guard.ts`.

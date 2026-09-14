@@ -44,6 +44,7 @@ Core fields:
 - chrome (boolean, optional): pass --chrome when running Claude
 - promptTemplate (string, optional): run prompt template
 - maxTurnsPerRun (number, optional): max turns for one run
+- maxBudgetUsdPerRun (number, optional, USD): per-run spend cap passed via --max-budget-usd; unset/0/negative disables the cap. Ignored on the ACP engine path and silently dropped when the CLI in the execution environment does not advertise --max-budget-usd.
 - dangerouslySkipPermissions (boolean, optional, default true): allow non-interactive Claude runs to proceed without approval prompts. Local targets receive --dangerously-skip-permissions; remote targets receive a curated --allowedTools list so they do not inherit local bypass permissions.
 - command (string, optional): defaults to "claude"
 - extraArgs (string[], optional): additional CLI args

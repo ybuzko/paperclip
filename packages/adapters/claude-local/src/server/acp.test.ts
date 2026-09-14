@@ -340,6 +340,54 @@ describe("claude_local ACP lane", () => {
     ).rejects.toThrow('networkScope must be "deny" or "allowlist"');
   });
 
+  describe("under the Claude CLI-only fleet policy", () => {
+    const originalPolicy = process.env.PAPERCLIP_CLAUDE_CLI_ONLY;
+
+    afterEach(() => {
+      if (originalPolicy === undefined) delete process.env.PAPERCLIP_CLAUDE_CLI_ONLY;
+      else process.env.PAPERCLIP_CLAUDE_CLI_ONLY = originalPolicy;
+    });
+
+    it("forces the explicit CLI lane for an unset or auto engine", async () => {
+      process.env.PAPERCLIP_CLAUDE_CLI_ONLY = "true";
+      await expect(
+        resolveClaudeExecutionEngineForRun({ config: {}, executionTarget: null }),
+      ).resolves.toEqual({ engine: "cli", explicit: true });
+      await expect(
+        resolveClaudeExecutionEngineForRun({ config: { engine: "auto" }, executionTarget: null }),
+      ).resolves.toEqual({ engine: "cli", explicit: true });
+      await expect(
+        resolveClaudeExecutionEngineForRun({ config: { engine: "cli" }, executionTarget: null }),
+      ).resolves.toEqual({ engine: "cli", explicit: true });
+    });
+
+    it("rejects an explicit ACP engine request with a policy error instead of throwing or falling back", async () => {
+      process.env.PAPERCLIP_CLAUDE_CLI_ONLY = "1";
+      const result = await resolveClaudeExecutionEngineForRun({
+        config: { engine: "acp" },
+        executionTarget: null,
+      });
+      expect(result.policyRejection).toMatchObject({ errorCode: "claude_cli_only_policy" });
+      expect(result.policyRejection?.reason).toContain("PAPERCLIP_CLAUDE_CLI_ONLY");
+    });
+
+    it("rejects an injected auth env var even when the engine is left on cli", async () => {
+      process.env.PAPERCLIP_CLAUDE_CLI_ONLY = "yes";
+      const result = await resolveClaudeExecutionEngineForRun({
+        config: { engine: "cli", env: { ANTHROPIC_API_KEY: "sk-ant-fake" } },
+        executionTarget: null,
+      });
+      expect(result.policyRejection).toMatchObject({ errorCode: "claude_cli_only_policy" });
+    });
+
+    it("is a no-op when the policy is off", async () => {
+      delete process.env.PAPERCLIP_CLAUDE_CLI_ONLY;
+      await expect(
+        resolveClaudeExecutionEngineForRun({ config: { engine: "acp" }, executionTarget: null }),
+      ).resolves.toEqual({ engine: "acp", explicit: true });
+    });
+  });
+
   it("uses ACP for bridged sandbox auto runs when the ACP command is configured as a shell command", async () => {
     setNodeVersion("v24.11.0");
     await expect(

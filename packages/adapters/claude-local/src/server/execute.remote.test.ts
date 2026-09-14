@@ -224,6 +224,99 @@ describe("claude remote execution", () => {
     }));
   });
 
+  it("appends --max-budget-usd when maxBudgetUsdPerRun is configured", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-budget-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    await execute({
+      runId: "run-budget-cap",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Claude Coder",
+        adapterType: "claude_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: "claude",
+        maxBudgetUsdPerRun: 7.505,
+      },
+      context: {
+        paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" },
+      },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      onLog: async () => {},
+    });
+
+    expect(runChildProcess).toHaveBeenCalledTimes(1);
+    const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[]] | undefined;
+    const args = call?.[2] ?? [];
+    expect(args).toContain("--max-budget-usd");
+    // Rounded to at most 2 decimals: 7.505 -> "7.51" (or "7.5" depending on
+    // floating-point rounding), never the raw unrounded value.
+    expect(args[args.indexOf("--max-budget-usd") + 1]).toMatch(/^7\.5\d?$/);
+  });
+
+  it("omits --max-budget-usd when maxBudgetUsdPerRun is unset, zero, or negative", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-no-budget-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    for (const maxBudgetUsdPerRun of [undefined, 0, -5]) {
+      runChildProcess.mockClear();
+      await execute({
+        runId: `run-no-budget-${String(maxBudgetUsdPerRun)}`,
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: {},
+        },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          command: "claude",
+          ...(maxBudgetUsdPerRun === undefined ? {} : { maxBudgetUsdPerRun }),
+        },
+        context: {
+          paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" },
+        },
+        executionTransport: {
+          remoteExecution: {
+            host: "127.0.0.1",
+            port: 2222,
+            username: "fixture",
+            remoteWorkspacePath: "/remote/workspace",
+            remoteCwd: "/remote/workspace",
+            privateKey: "PRIVATE KEY",
+            knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+            strictHostKeyChecking: true,
+          },
+        },
+        onLog: async () => {},
+      });
+
+      expect(runChildProcess).toHaveBeenCalledTimes(1);
+      const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[]] | undefined;
+      expect(call?.[2]).not.toContain("--max-budget-usd");
+    }
+  });
+
   it("does not resume saved Claude sessions for remote SSH execution without a matching remote identity", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-resume-"));
     cleanupDirs.push(rootDir);
