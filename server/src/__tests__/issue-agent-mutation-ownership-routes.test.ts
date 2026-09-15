@@ -189,6 +189,8 @@ function registerRouteMocks() {
   vi.doMock("../services/cross-issue-influence-limit.js", () => ({
     observeCrossIssueInfluence: mockObserveCrossIssueInfluence,
     crossIssueInfluenceLimitError: vi.fn(),
+    agentIssueWriteRunContextOptional: () => false,
+    recordAgentIssueWriteWithoutRunContext: vi.fn(async () => undefined),
     crossIssueInfluenceRunContextError: () => new HttpError(
       403,
       "Agent issue comments and updates require a valid heartbeat run so cross-issue influence can be contained",

@@ -54,6 +54,7 @@ Paperclip now treats **bind** as a separate concern from auth:
 - private-host trust policy required
 - Better Auth request rate limiting is off by default for private mode to keep local/LAN repair loops from locking out the operator; set `PAPERCLIP_AUTH_RATE_LIMIT_ENABLED=true` to opt in
 - bind can be `loopback`, `lan`, `tailnet`, or `custom`
+- agent issue comments, updates, and interaction cards require a heartbeat run id by default (`cross_issue_influence_run_context_required`); set `PAPERCLIP_AGENT_ISSUE_WRITE_RUN_CONTEXT=optional` in the instance `.env` when invited agents also act from outside Paperclip-triggered runs (remote daemons, manual sessions). Writes without a run are audited as `issue.agent_write_without_run_context`; writes that carry a run id keep the per-run cross-issue cap
 
 ## `authenticated + public`
 
