@@ -24,6 +24,12 @@ export function getConfigSchema(): AdapterConfigSchema {
         meta: { secret: true },
       },
       {
+        key: "telegramChatId",
+        label: "Telegram forum chat id",
+        type: "text",
+        hint: "Chat id of the Telegram forum group this daemon serves (e.g. -1001234567890). A project whose CLAUDECLAW_THREAD env is a bare topic id is routed to tg:<chatId>:<topicId>. Not needed when every project binds a full session key.",
+      },
+      {
         key: "timeoutSec",
         label: "Timeout seconds",
         type: "number",

@@ -101,6 +101,7 @@ import type {
 } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
+import { buildAdapterProjectContext } from "./heartbeat-project-context.js";
 import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
@@ -14265,6 +14266,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ? await db
           .select({
             id: projects.id,
+            name: projects.name,
             executionWorkspacePolicy: projects.executionWorkspacePolicy,
             env: projects.env,
             updatedAt: projects.updatedAt,
@@ -16263,6 +16265,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
         } else {
           const adapterContext = { ...context };
+          // Gateway adapters never see the resolved run env, so hand them the
+          // project identity and the project's plain (non-secret) env values.
+          // Secret-backed bindings stay out of the context on purpose.
+          const adapterProjectContext = buildAdapterProjectContext(projectContext);
+          if (adapterProjectContext) {
+            adapterContext.projectId = adapterProjectContext.projectId;
+            adapterContext.projectName = adapterProjectContext.projectName;
+            adapterContext.projectEnv = adapterProjectContext.projectEnv;
+          }
           const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
             db,
             agent,

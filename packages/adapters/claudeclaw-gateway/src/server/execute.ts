@@ -76,6 +76,130 @@ export function resolveClaimedApiKeyPath(value: unknown): string {
   return nonEmpty(value) ?? DEFAULT_CLAIMED_API_KEY_PATH;
 }
 
+/** Project env key holding the claudeclaw thread binding (PIX-4 plan §13.3 / §14.1). */
+export const THREAD_ENV_KEY = "CLAUDECLAW_THREAD";
+/** Project env key naming the daemon workspace for the project (informational, echoed in the wake). */
+export const WORKSPACE_ENV_KEY = "CLAUDECLAW_WORKSPACE";
+/** Project env key naming the Jira project (informational, echoed in the wake when set). */
+export const JIRA_PROJECT_ENV_KEY = "JIRA_PROJECT";
+
+export type ThreadBinding = {
+  projectId: string;
+  projectName: string | null;
+  /** Full claudeclaw session key, e.g. `tg:-100123:42` or `paperclip:FT`. */
+  thread: string;
+  /** Raw value of CLAUDECLAW_THREAD on the project. */
+  rawBinding: string;
+  workspace: string | null;
+  jiraProject: string | null;
+};
+
+export type ThreadResolution =
+  | { ok: true; binding: ThreadBinding }
+  | { ok: false; errorCode: "claudeclaw_gateway_thread_unmapped"; errorMessage: string; errorMeta: Record<string, unknown> };
+
+function readProjectEnv(context: Record<string, unknown>): Record<string, string> {
+  const raw = asRecord(context.projectEnv);
+  if (!raw) return {};
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const trimmed = nonEmpty(value);
+    if (trimmed) out[key] = trimmed;
+  }
+  return out;
+}
+
+/**
+ * Compose the claudeclaw session key for a project binding.
+ * A value containing ":" is already a full session key and is used verbatim.
+ * A bare value is a Telegram forum topic id and composes to `tg:<chatId>:<topicId>`.
+ * Exported for tests.
+ */
+export function composeThreadKey(rawBinding: string, telegramChatId: string | null): string | null {
+  const value = rawBinding.trim();
+  if (!value) return null;
+  if (value.includes(":")) return value;
+  if (!telegramChatId) return null;
+  return `tg:${telegramChatId}:${value}`;
+}
+
+/**
+ * Resolve the thread a wake must be injected into from the project binding
+ * on the execution context. Never falls back to the daemon's global session.
+ * Exported for tests.
+ */
+export function resolveThreadBinding(ctx: AdapterExecutionContext): ThreadResolution {
+  const context = ctx.context ?? {};
+  const projectId = nonEmpty(context.projectId);
+  const issueId = nonEmpty(context.taskId) ?? nonEmpty(context.issueId);
+  const wakeReason = nonEmpty(context.wakeReason) ?? "unknown";
+  const telegramChatId = nonEmpty(ctx.config.telegramChatId);
+
+  if (!projectId) {
+    return {
+      ok: false,
+      errorCode: "claudeclaw_gateway_thread_unmapped",
+      errorMessage: issueId
+        ? `Wake for issue ${issueId} (reason ${wakeReason}) carries no project, so no claudeclaw thread can be chosen. ` +
+          "Move the issue into a project that binds CLAUDECLAW_THREAD in its env. Wakes are never injected into the global session."
+        : `Wake with no issue and no project (reason ${wakeReason}) has no claudeclaw thread to target and was skipped. ` +
+          "Timer heartbeats are not routed for claudeclaw_gateway agents; assign issues inside a project that binds CLAUDECLAW_THREAD.",
+      errorMeta: { wakeReason, issueId, projectId: null },
+    };
+  }
+
+  const projectName = nonEmpty(context.projectName);
+  const projectLabel = projectName ? `${projectName} (${projectId})` : projectId;
+  const env = readProjectEnv(context);
+  const rawBinding = env[THREAD_ENV_KEY] ?? null;
+  if (!rawBinding) {
+    return {
+      ok: false,
+      errorCode: "claudeclaw_gateway_thread_unmapped",
+      errorMessage:
+        `Project ${projectLabel} has no ${THREAD_ENV_KEY} in its env, so this wake cannot be routed to a claudeclaw thread. ` +
+        `Set ${THREAD_ENV_KEY} on the project to a Telegram topic id (with adapter telegramChatId configured) or a full session key such as paperclip:FT. ` +
+        "Wakes are never injected into the global session.",
+      errorMeta: { wakeReason, issueId, projectId, projectName, envKey: THREAD_ENV_KEY },
+    };
+  }
+
+  const thread = composeThreadKey(rawBinding, telegramChatId);
+  if (!thread) {
+    return {
+      ok: false,
+      errorCode: "claudeclaw_gateway_thread_unmapped",
+      errorMessage:
+        `Project ${projectLabel} binds ${THREAD_ENV_KEY}=${rawBinding} as a bare topic id, but the adapter has no telegramChatId to compose tg:<chatId>:<topicId>. ` +
+        "Set telegramChatId on the agent's adapter config or bind a full session key on the project.",
+      errorMeta: { wakeReason, issueId, projectId, projectName, envKey: THREAD_ENV_KEY, rawBinding },
+    };
+  }
+
+  return {
+    ok: true,
+    binding: {
+      projectId,
+      projectName,
+      thread,
+      rawBinding,
+      workspace: env[WORKSPACE_ENV_KEY] ?? null,
+      jiraProject: env[JIRA_PROJECT_ENV_KEY] ?? null,
+    },
+  };
+}
+
+/** First line of the wake: the turn states its own project/thread/workspace context. */
+export function buildContextPrefix(binding: ThreadBinding): string {
+  const parts = [
+    `Project: ${binding.projectName ?? binding.projectId}`,
+    `thread ${binding.thread}`,
+    `workspace ${binding.workspace ?? "<unset>"}`,
+  ];
+  if (binding.jiraProject) parts.push(`Jira ${binding.jiraProject}`);
+  return parts.join(" · ");
+}
+
 function buildWakePayload(ctx: AdapterExecutionContext): WakePayload {
   const { runId, agent, context } = ctx;
   return {
@@ -219,7 +343,7 @@ function joinWakePayloadSections(structuredWakePrompt: string, structuredWakeJso
   return sections.join("\n");
 }
 
-export function buildWakeMessage(ctx: AdapterExecutionContext): string {
+export function buildWakeMessage(ctx: AdapterExecutionContext, binding?: ThreadBinding | null): string {
   const wakePayload = buildWakePayload(ctx);
   const paperclipApiUrl = resolvePaperclipApiUrl(ctx.config.paperclipApiUrl);
   const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload, paperclipApiUrl);
@@ -229,7 +353,7 @@ export function buildWakeMessage(ctx: AdapterExecutionContext): string {
     includeExecutionContract: true,
   });
   const structuredWakeJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake);
-  return buildWakeText(
+  const text = buildWakeText(
     wakePayload,
     paperclipEnv,
     structuredWakeJson
@@ -237,6 +361,7 @@ export function buildWakeMessage(ctx: AdapterExecutionContext): string {
       : structuredWakePrompt,
     resolveClaimedApiKeyPath(ctx.config.claimedApiKeyPath),
   );
+  return binding ? `${buildContextPrefix(binding)}\n\n${text}` : text;
 }
 
 function redactToken(text: string, token: string): string {
@@ -421,24 +546,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
   }
 
+  const resolution = resolveThreadBinding(ctx);
+  if (!resolution.ok) {
+    await ctx.onLog("stderr", `${LOG_PREFIX} ${resolution.errorCode}: ${resolution.errorMessage}\n`);
+    return failure({
+      errorCode: resolution.errorCode,
+      errorMessage: resolution.errorMessage,
+      errorMeta: resolution.errorMeta,
+    });
+  }
+  const { binding } = resolution;
+
   const timeoutSec = Math.max(0, Math.floor(asNumber(ctx.config.timeoutSec, DEFAULT_TIMEOUT_SEC)));
   const timeoutMs = timeoutSec > 0 ? timeoutSec * 1000 : 0;
   const injectUrl = apiUrl(baseUrl, "/api/inject");
-  const message = buildWakeMessage(ctx);
+  const message = buildWakeMessage(ctx, binding);
 
   if (ctx.onMeta) {
     await ctx.onMeta({
       adapterType: ADAPTER_TYPE,
       command: "claudeclaw",
-      commandArgs: ["inject", injectUrl],
+      commandArgs: ["inject", injectUrl, "--thread", binding.thread],
       prompt: message,
-      context: ctx.context,
+      context: { ...ctx.context, claudeclawThread: binding.thread },
     });
   }
 
   await ctx.onLog(
     "stdout",
-    `${LOG_PREFIX} POST ${injectUrl} (forward=false, timeout=${timeoutSec > 0 ? `${timeoutSec}s` : "none"}, message=${message.length} chars)\n`,
+    `${LOG_PREFIX} POST ${injectUrl} (thread=${binding.thread}, project=${binding.projectName ?? binding.projectId}, forward=false, timeout=${timeoutSec > 0 ? `${timeoutSec}s` : "none"}, message=${message.length} chars)\n`,
   );
 
   let response: Response;
@@ -450,7 +586,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         "Content-Type": "application/json",
         Accept: "application/json",
       },
-      body: JSON.stringify({ message, forward: false }),
+      body: JSON.stringify({ message, forward: false, thread: binding.thread }),
       ...(timeoutMs > 0 ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
     });
   } catch (err) {
@@ -458,7 +594,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await ctx.onLog("stderr", `${LOG_PREFIX} inject timed out after ${timeoutSec}s\n`);
       return failure({
         errorCode: "claudeclaw_gateway_timeout",
-        errorMessage: `claudeclaw inject timed out after ${timeoutSec}s. The daemon may still be running the turn; it serializes injects, so the next wake waits behind it.`,
+        errorMessage: `claudeclaw inject timed out after ${timeoutSec}s. The daemon may still be running the turn in thread ${binding.thread}; wakes for the same thread queue behind it.`,
         errorFamily: "transient_upstream",
         timedOut: true,
       });

@@ -107,6 +107,7 @@ export function ClaudeclawGatewayConfigFields({
   };
 
   const url = String(readValue("url", "") ?? "");
+  const telegramChatId = String(readValue("telegramChatId", "") ?? "");
   const paperclipApiUrl = String(readValue("paperclipApiUrl", "") ?? "");
   const claimedApiKeyPath = String(readValue("claimedApiKeyPath", "") ?? "");
   const timeoutSec = Number(readValue("timeoutSec", DEFAULT_TIMEOUT_SEC) ?? DEFAULT_TIMEOUT_SEC);
@@ -133,6 +134,19 @@ export function ClaudeclawGatewayConfigFields({
         placeholder="claudeclaw settings.apiToken, not PAPERCLIP_API_KEY"
         stored={!isCreate && hasStoredApiToken && !editApiTokenValue}
       />
+
+      <Field
+        label="Telegram forum chat id"
+        hint="Chat id of the Telegram forum group this daemon serves (e.g. -1001234567890). A project whose CLAUDECLAW_THREAD env is a bare topic id is routed to tg:<chatId>:<topicId>. Leave empty when every project binds a full session key."
+      >
+        <DraftInput
+          value={telegramChatId}
+          onCommit={(v) => writeValue("telegramChatId", v || undefined)}
+          immediate
+          className={inputClass}
+          placeholder="-1001234567890"
+        />
+      </Field>
 
       <Field label="Timeout seconds" hint="How long Paperclip waits for the blocking inject call before aborting the run.">
         <DraftNumberInput

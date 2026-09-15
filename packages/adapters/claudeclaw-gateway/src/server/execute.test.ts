@@ -1,11 +1,19 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AdapterExecutionContext, AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
-import { buildWakeMessage, execute, mapInjectResponse } from "./execute.js";
+import {
+  buildWakeMessage,
+  composeThreadKey,
+  execute,
+  mapInjectResponse,
+  resolveThreadBinding,
+} from "./execute.js";
 import { testEnvironment } from "./test.js";
 import { sessionCodec } from "./index.js";
 
 const API_TOKEN = "claw-secret-token";
+const CHAT_ID = "-1001234567890";
+const PROJECT_ENV = { CLAUDECLAW_THREAD: "42", CLAUDECLAW_WORKSPACE: "/home/galileo/ft", JIRA_PROJECT: "FT" };
 
 type StubBehaviour = {
   inject?: (req: IncomingMessage, body: string, res: ServerResponse) => void | Promise<void>;
@@ -91,8 +99,9 @@ afterEach(async () => {
   }
 });
 
-function makeCtx(config: Record<string, unknown>, overrides?: Partial<AdapterExecutionContext>): AdapterExecutionContext {
+function makeCtx(rawConfig: Record<string, unknown>, overrides?: Partial<AdapterExecutionContext>): AdapterExecutionContext {
   const logs: Array<{ stream: string; chunk: string }> = [];
+  const config = { telegramChatId: CHAT_ID, ...rawConfig };
   return {
     runId: "run-1",
     agent: {
@@ -109,6 +118,9 @@ function makeCtx(config: Record<string, unknown>, overrides?: Partial<AdapterExe
       issueId: "issue-1",
       wakeReason: "issue_assigned",
       issueIds: ["issue-1"],
+      projectId: "proj-ft",
+      projectName: "Fleet Tools",
+      projectEnv: PROJECT_ENV,
       paperclipWake: {
         reason: "issue_assigned",
         issue: { id: "issue-1", identifier: "PIX-9", title: "Do the thing", status: "todo", priority: "medium" },
@@ -168,7 +180,58 @@ describe("execute", () => {
     expect(typeof body.message).toBe("string");
     expect(String(body.message)).toContain("Paperclip wake event for a claudeclaw gateway agent.");
     expect(String(body.message)).not.toContain(API_TOKEN);
-    expect(Object.keys(body).sort()).toEqual(["forward", "message"]);
+    expect(body.thread).toBe(`tg:${CHAT_ID}:42`);
+    expect(Object.keys(body).sort()).toEqual(["forward", "message", "thread"]);
+    expect(String(body.message).split("\n")[0]).toBe(
+      `Project: Fleet Tools · thread tg:${CHAT_ID}:42 · workspace /home/galileo/ft · Jira FT`,
+    );
+  });
+
+  it("passes a full session key from CLAUDECLAW_THREAD through to the inject body verbatim", async () => {
+    const stub = await startStub();
+    const ctx = makeCtx({ url: stub.url, apiToken: API_TOKEN, timeoutSec: 5 });
+    ctx.context.projectEnv = { CLAUDECLAW_THREAD: "paperclip:FT" };
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionParams).toEqual({ claudeclawSessionId: "sess-123" });
+    const body = stub.requests.find((entry) => entry.path === "/api/inject")?.body as Record<string, unknown>;
+    expect(body.thread).toBe("paperclip:FT");
+    expect(String(body.message).split("\n")[0]).toBe("Project: Fleet Tools · thread paperclip:FT · workspace <unset>");
+  });
+
+  it("fails as thread_unmapped without contacting the daemon when the project has no binding", async () => {
+    const stub = await startStub();
+    const ctx = makeCtx({ url: stub.url, apiToken: API_TOKEN, timeoutSec: 5 });
+    ctx.context.projectEnv = { JIRA_PROJECT: "FT" };
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("claudeclaw_gateway_thread_unmapped");
+    expect(result.errorFamily ?? null).toBeNull();
+    expect(result.errorMessage).toContain("Fleet Tools (proj-ft)");
+    expect(result.errorMessage).toContain("CLAUDECLAW_THREAD");
+    expect(stub.requests).toHaveLength(0);
+  });
+
+  it("fails as thread_unmapped for a bare topic id when telegramChatId is not configured", async () => {
+    const stub = await startStub();
+    const ctx = makeCtx({ url: stub.url, apiToken: API_TOKEN, timeoutSec: 5, telegramChatId: "" });
+    const result = await execute(ctx);
+    expect(result.errorCode).toBe("claudeclaw_gateway_thread_unmapped");
+    expect(result.errorMessage).toContain("telegramChatId");
+    expect(stub.requests).toHaveLength(0);
+  });
+
+  it("skips a timer wake with no issue and no project instead of hitting the global session", async () => {
+    const stub = await startStub();
+    const ctx = makeCtx(
+      { url: stub.url, apiToken: API_TOKEN, timeoutSec: 5 },
+      { context: { wakeReason: "timer", issueIds: [] } },
+    );
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("claudeclaw_gateway_thread_unmapped");
+    expect(result.errorMessage).toContain("no issue and no project");
+    expect(stub.requests).toHaveLength(0);
   });
 
   it("fails with a clear fork-patch error when the response has no sessionId", async () => {
@@ -238,6 +301,45 @@ describe("execute", () => {
     expect((await execute(makeCtx({ apiToken: API_TOKEN }))).errorCode).toBe("claudeclaw_gateway_url_missing");
     expect((await execute(makeCtx({ url: "ws://x" , apiToken: API_TOKEN }))).errorCode).toBe("claudeclaw_gateway_url_invalid");
     expect((await execute(makeCtx({ url: "http://127.0.0.1:1" }))).errorCode).toBe("claudeclaw_gateway_api_token_missing");
+  });
+});
+
+describe("resolveThreadBinding", () => {
+  it("composes a bare topic id with the adapter's telegramChatId", () => {
+    expect(composeThreadKey("42", CHAT_ID)).toBe(`tg:${CHAT_ID}:42`);
+    expect(composeThreadKey(" 42 ", CHAT_ID)).toBe(`tg:${CHAT_ID}:42`);
+    expect(composeThreadKey("42", null)).toBeNull();
+    expect(composeThreadKey("", CHAT_ID)).toBeNull();
+  });
+
+  it("uses a value containing ':' as the full session key regardless of telegramChatId", () => {
+    expect(composeThreadKey("paperclip:FT", null)).toBe("paperclip:FT");
+    expect(composeThreadKey("tg:-100999:7", CHAT_ID)).toBe("tg:-100999:7");
+  });
+
+  it("reads the binding from the project env on the execution context", () => {
+    const resolution = resolveThreadBinding(makeCtx({ url: "http://127.0.0.1:1", apiToken: API_TOKEN }));
+    expect(resolution.ok).toBe(true);
+    if (!resolution.ok) return;
+    expect(resolution.binding).toEqual({
+      projectId: "proj-ft",
+      projectName: "Fleet Tools",
+      thread: `tg:${CHAT_ID}:42`,
+      rawBinding: "42",
+      workspace: "/home/galileo/ft",
+      jiraProject: "FT",
+    });
+  });
+
+  it("fails when an issue wake carries no project", () => {
+    const ctx = makeCtx({ url: "http://127.0.0.1:1", apiToken: API_TOKEN });
+    delete ctx.context.projectId;
+    const resolution = resolveThreadBinding(ctx);
+    expect(resolution.ok).toBe(false);
+    if (resolution.ok) return;
+    expect(resolution.errorCode).toBe("claudeclaw_gateway_thread_unmapped");
+    expect(resolution.errorMessage).toContain("issue-1");
+    expect(resolution.errorMeta).toEqual({ wakeReason: "issue_assigned", issueId: "issue-1", projectId: null });
   });
 });
 
