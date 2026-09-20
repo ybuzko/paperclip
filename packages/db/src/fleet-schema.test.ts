@@ -2,6 +2,7 @@ import { getTableConfig } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
 import {
   fleetCalibration,
+  fleetDispatchState,
   fleetLimitSnapshots,
   fleetSettings,
   fleetThrottleStates,
@@ -97,5 +98,35 @@ describe("fleet governor ledger schema", () => {
     for (const table of [fleetLimitSnapshots, fleetThrottleStates, fleetCalibration, fleetSettings]) {
       expect(columnNames(table)).not.toContain("company_id");
     }
+  });
+
+  it("names fleet_dispatch_state and its columns per the dispatch-loop data model", () => {
+    const config = getTableConfig(fleetDispatchState);
+    expect(config.name).toBe("fleet_dispatch_state");
+    expect(columnNames(fleetDispatchState)).toEqual([
+      "project_id",
+      "company_id",
+      "jira_project",
+      "lead_agent_id",
+      "dispatch_issue_id",
+      "last_poll_at",
+      "ready_tasks",
+      "epics_to_explode",
+      "epics_to_close",
+      "epic_keys_to_close",
+      "counts_fingerprint",
+      "last_decision",
+      "last_nudge_at",
+      "last_nudge_wake_id",
+      "backoff_level",
+      "last_ack",
+      "last_error",
+      "updated_at",
+    ]);
+    expect(indexColumns(fleetDispatchState, "fleet_dispatch_state_company_idx")).toEqual(["company_id"]);
+  });
+
+  it("scopes fleet_dispatch_state to a company, unlike the instance-wide governor tables", () => {
+    expect(columnNames(fleetDispatchState)).toContain("company_id");
   });
 });

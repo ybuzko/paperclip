@@ -1676,6 +1676,13 @@ export {
   patchFleetSettingsSchema,
   type GovernorParamsPatch,
   type PatchFleetSettings,
+  dispatchParamsPatchSchema,
+  dispatchModeSchema,
+  dispatchJiraSettingsSchema,
+  patchFleetDispatchSettingsSchema,
+  type DispatchParamsPatch,
+  type DispatchJiraSettings,
+  type PatchFleetDispatchSettings,
 } from "./validators/index.js";
 
 export {

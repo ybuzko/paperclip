@@ -109,6 +109,7 @@ import {
 } from "./shutdown.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { getSharedFleetGovernorService } from "./services/fleet/governor-service.js";
+import { getSharedFleetDispatchService } from "./services/fleet/dispatch-service.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
 import {
   createEmbeddedPostgresSupervisor,
@@ -1075,6 +1076,7 @@ export async function startServer(): Promise<StartedServer> {
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
   let fleetGovernorStop: (() => void) | null = null;
+  let fleetDispatchStop: (() => void) | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1685,6 +1687,25 @@ export async function startServer(): Promise<StartedServer> {
     logger.info(`Fleet governor started (mode=${fleetGovernorStatus?.mode ?? "shadow"})`);
   }
 
+  if (!["0", "false"].includes((process.env.PAPERCLIP_FLEET_DISPATCH_ENABLED ?? "").toLowerCase())) {
+    if (!heartbeat) {
+      logger.info("fleet dispatch: heartbeat scheduler is disabled; skipping start (no wakeup available)");
+    } else {
+      // Constructing the shared instance here (rather than letting
+      // routes/fleet-dispatch.ts construct it lazily on first request) is
+      // what gives it the real `heartbeat.wakeup` — see the comment in that
+      // route module for why call order matters for this particular shared
+      // service.
+      const fleetDispatch = getSharedFleetDispatchService({ db, logger, wakeup: heartbeat.wakeup });
+      const fleetDispatchStatus = await fleetDispatch.getStatus().catch((err) => {
+        logger.error({ err }, "fleet dispatch: failed to read initial status");
+        return null;
+      });
+      fleetDispatchStop = fleetDispatch.start();
+      logger.info(`Fleet dispatch started (mode=${fleetDispatchStatus?.mode ?? "shadow"})`);
+    }
+  }
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
@@ -1778,6 +1799,10 @@ export async function startServer(): Promise<StartedServer> {
       if (fleetGovernorStop) {
         fleetGovernorStop();
         fleetGovernorStop = null;
+      }
+      if (fleetDispatchStop) {
+        fleetDispatchStop();
+        fleetDispatchStop = null;
       }
 
       const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({

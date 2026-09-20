@@ -53,6 +53,16 @@ export {
 } from "./fleet.js";
 
 export {
+  dispatchParamsPatchSchema,
+  dispatchModeSchema,
+  dispatchJiraSettingsSchema,
+  patchFleetDispatchSettingsSchema,
+  type DispatchParamsPatch,
+  type DispatchJiraSettings,
+  type PatchFleetDispatchSettings,
+} from "./fleet-dispatch.js";
+
+export {
   upsertBudgetPolicySchema,
   resolveBudgetIncidentSchema,
   type UpsertBudgetPolicy,

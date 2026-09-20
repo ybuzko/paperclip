@@ -1611,6 +1611,13 @@
       "when": 1789346235099,
       "tag": "0231_fleet_governor_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 232,
+      "version": "7",
+      "when": 1789347235099,
+      "tag": "0232_fleet_dispatch_state",
+      "breakpoints": true
     }
   ]
 }
