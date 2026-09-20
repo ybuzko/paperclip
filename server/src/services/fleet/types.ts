@@ -57,6 +57,14 @@ export interface GovernorParams {
   bucketHoldPct: number;
   /** A window is STALE if no snapshot younger than this exists (FR-1.3). §6 `stale_after` [proposed: 15 min]. */
   staleAfterMs: number;
+  /**
+   * Minimum fraction (0..1) of the weekly window that must have elapsed
+   * before pace tiers (amber_pace/red_pace/accel_pace) are applied. Below
+   * this, pace = usedPct / elapsedFraction is dominated by noise (a tiny
+   * denominator), so the governor holds the previous state (or GREEN with no
+   * history) instead of reacting to it. Default 0.10 (10% of the week, ~16.8h).
+   */
+  minElapsedFraction: number;
   /** Sensing cadence (FR-1.1). §6 `sense_interval` [proposed: 5 min]. */
   senseIntervalMs: number;
   /** §6 `default_model` (decided): supervisors opus; coders sonnet; evaluators sonnet. */
@@ -83,6 +91,7 @@ export const DEFAULT_GOVERNOR_PARAMS: GovernorParams = {
   hysteresisPp: 5,
   bucketHoldPct: 90,
   staleAfterMs: 15 * 60 * 1000,
+  minElapsedFraction: 0.1,
   senseIntervalMs: 5 * 60 * 1000,
   defaultModels: { supervisor: "opus", coder: "sonnet", evaluator: "sonnet" },
   amberModel: "sonnet",
@@ -131,4 +140,40 @@ export interface GovernorDecision {
     /** ACCELERATE (FR-4.5): release P3 sweeper work. */
     releaseP3Sweepers: boolean;
   };
+}
+
+/**
+ * Project priority class for run admission (task 2). Sourced from the
+ * project's `env` jsonb, key `FLEET_CLASS`; defaults to `P2` when unset,
+ * unparseable, or the project/projectId is unknown.
+ */
+export type ProjectClass = "P0" | "P1" | "P2";
+
+/**
+ * Output of `FleetGovernorService.getAdmission()` — whether a run is allowed
+ * to start right now, independent of budgets. This is a read of the
+ * governor's *latest decision*, not a new policy computation: the actual
+ * throttle-state math stays in `decideThrottle` above.
+ */
+export interface FleetAdmission {
+  /**
+   * Whether the caller may proceed. In shadow mode this is always `true`
+   * (the governor never blocks in shadow mode); in enforce mode it is `false`
+   * when the admission rules would block this run.
+   */
+  allowed: boolean;
+  mode: "shadow" | "enforce";
+  /** The throttle state the decision was based on, or null if no decision exists yet. */
+  state: ThrottleState | null;
+  /** True when there is no recent-enough governor decision to trust (see getAdmission's rules). */
+  stale: boolean;
+  /** Human-readable explanation of the admission verdict, for logs/audit. */
+  reason: string;
+  projectClass: ProjectClass;
+  /**
+   * True when the admission rules evaluated to "block", regardless of mode.
+   * In shadow mode this is the only signal that a run *would* have been
+   * blocked under enforce; in enforce mode it mirrors `!allowed`.
+   */
+  wouldBlock: boolean;
 }

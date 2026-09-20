@@ -17,6 +17,7 @@ import {
   fleetLimitSnapshots,
   fleetSettings,
   fleetThrottleStates,
+  projects,
   type Db,
 } from "@paperclipai/db";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/shared";
@@ -24,10 +25,12 @@ import { fetchAllQuotaWindows } from "../quota-windows.js";
 import { decideThrottle, latestSnapshotByWindow, nextSenseDueAt } from "./policy.js";
 import {
   DEFAULT_GOVERNOR_PARAMS,
+  type FleetAdmission,
   type FleetWindow,
   type GovernorDecision,
   type GovernorParams,
   type LimitSnapshot,
+  type ProjectClass,
   type ThrottleState,
 } from "./types.js";
 
@@ -178,12 +181,26 @@ export interface FleetGovernorStatusSnapshot {
   stale: boolean;
 }
 
+/** Last blocked (`allowed: false`) admission verdict, for operator visibility. */
+export interface FleetAdmissionLastBlock {
+  at: Date;
+  agentId: string;
+  reason: string;
+}
+
 export interface FleetGovernorStatus {
   mode: GovernorMode;
   params: GovernorParams;
   snapshots: FleetGovernorStatusSnapshot[];
   latestDecision: FleetThrottleStateRow | null;
   nextDueAt: Date;
+  /** Cumulative count of getAdmission() calls that returned allowed:true. */
+  admissionsAllowed: number;
+  /** Cumulative count of getAdmission() calls that returned allowed:false (enforce mode only). */
+  admissionsBlocked: number;
+  /** Cumulative count of getAdmission() calls where the admission rules evaluated to "block" (shadow mode). */
+  admissionsWouldBlock: number;
+  lastBlock: FleetAdmissionLastBlock | null;
 }
 
 export interface FleetGovernorServiceDeps {
@@ -195,17 +212,45 @@ export interface FleetGovernorServiceDeps {
   now?: () => Date;
 }
 
+export interface GetAdmissionInput {
+  companyId: string;
+  agentId: string;
+  projectId?: string | null;
+}
+
 export interface FleetGovernorService {
   senseOnce(): Promise<SenseResult>;
   evaluate(): Promise<EvaluateResult>;
   tick(): Promise<TickResult>;
   start(): () => void;
   getStatus(): Promise<FleetGovernorStatus>;
+  getAdmission(input: GetAdmissionInput): Promise<FleetAdmission>;
+}
+
+/** Minimal shape of the latest decision, cached in-memory by evaluate() for getAdmission(). */
+interface CachedDecision {
+  ts: Date;
+  state: ThrottleState;
+  reason: string;
+  fiveHourPct: number | null;
 }
 
 export function createFleetGovernorService(deps: FleetGovernorServiceDeps): FleetGovernorService {
   const fetchQuota = deps.fetchQuota ?? fetchAllQuotaWindows;
   const now = () => deps.now?.() ?? new Date();
+
+  // In-memory cache of the latest decision, refreshed on every evaluate()
+  // (i.e. every tick()). getAdmission() reads this first and only falls back
+  // to the database when this process has not ticked yet (e.g. right after
+  // startup, or in a process that only serves getAdmission()).
+  let lastDecisionCache: CachedDecision | null = null;
+
+  const admissionCounters: {
+    allowed: number;
+    blocked: number;
+    wouldBlock: number;
+    lastBlock: FleetAdmissionLastBlock | null;
+  } = { allowed: 0, blocked: 0, wouldBlock: 0, lastBlock: null };
 
   async function loadSettingsValue(key: string): Promise<Record<string, unknown> | null> {
     const rows = await deps.db.select().from(fleetSettings).where(eq(fleetSettings.key, key)).limit(1);
@@ -322,6 +367,16 @@ export function createFleetGovernorService(deps: FleetGovernorServiceDeps): Flee
     const policySnapshots = toPolicySnapshots(latestRows);
     const previousState: ThrottleState | null = (previousRow?.state as ThrottleState | undefined) ?? null;
     const decision = decideThrottle({ snapshots: policySnapshots, previousState, params, now: asOf });
+
+    // Refresh the in-memory admission cache on every evaluate(), whether or
+    // not the decision changed enough to persist — getAdmission() needs the
+    // freshest decision timestamp to judge staleness correctly.
+    lastDecisionCache = {
+      ts: asOf,
+      state: decision.state,
+      reason: decision.reason,
+      fiveHourPct: decision.fiveHourPct,
+    };
 
     const changed =
       !previousRow ||
@@ -463,10 +518,117 @@ export function createFleetGovernorService(deps: FleetGovernorServiceDeps): Flee
     const latestMap = latestSnapshotByWindow(toPolicySnapshots(latestRows));
     const nextDueAt = nextSenseDueAt(latestMap, asOf, params);
 
-    return { mode, params, snapshots, latestDecision, nextDueAt };
+    return {
+      mode,
+      params,
+      snapshots,
+      latestDecision,
+      nextDueAt,
+      admissionsAllowed: admissionCounters.allowed,
+      admissionsBlocked: admissionCounters.blocked,
+      admissionsWouldBlock: admissionCounters.wouldBlock,
+      lastBlock: admissionCounters.lastBlock,
+    };
   }
 
-  return { senseOnce, evaluate, tick, start, getStatus };
+  /** FLEET_CLASS from a project's env jsonb (task 2), defaulting to P2. */
+  async function resolveProjectClass(
+    projectId: string | null | undefined,
+    companyId: string,
+  ): Promise<ProjectClass> {
+    if (!projectId) return "P2";
+    const rows = await deps.db
+      .select({ env: projects.env })
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+      .limit(1);
+    const env = rows[0]?.env as Record<string, unknown> | null | undefined;
+    const raw = env?.FLEET_CLASS;
+    let value: unknown = raw;
+    if (raw && typeof raw === "object" && (raw as { type?: unknown }).type === "plain") {
+      value = (raw as { value?: unknown }).value;
+    }
+    return value === "P0" || value === "P1" ? value : "P2";
+  }
+
+  /**
+   * Run admission (task 2): a read of the governor's latest decision, not a
+   * new policy computation. Never dispatches, cancels, or mutates anything —
+   * callers (heartbeat.ts) decide what "not allowed" means for a run.
+   */
+  async function getAdmission(input: GetAdmissionInput): Promise<FleetAdmission> {
+    const asOf = now();
+    const [params, mode, projectClass] = await Promise.all([
+      loadEffectiveParams(),
+      loadEffectiveMode(),
+      resolveProjectClass(input.projectId, input.companyId),
+    ]);
+
+    let decisionTs: Date | null = null;
+    let state: ThrottleState | null = null;
+    let decisionReason = "";
+    let fiveHourPct: number | null = null;
+
+    if (lastDecisionCache) {
+      decisionTs = lastDecisionCache.ts;
+      state = lastDecisionCache.state;
+      decisionReason = lastDecisionCache.reason;
+      fiveHourPct = lastDecisionCache.fiveHourPct;
+    } else {
+      const row = await loadLatestThrottleStateRow();
+      if (row) {
+        decisionTs = row.ts;
+        state = row.state as ThrottleState;
+        decisionReason = row.reason;
+        fiveHourPct = row.fiveHourPct;
+      }
+    }
+
+    const stale = decisionTs == null || asOf.getTime() - decisionTs.getTime() > params.staleAfterMs;
+    const floorActive = fiveHourPct != null && fiveHourPct >= params.floor5h;
+
+    let blocked: boolean;
+    let ruleReason: string;
+    if (stale) {
+      blocked = true;
+      ruleReason =
+        state != null
+          ? `stale: last governor decision (${state}) is older than staleAfterMs (${Math.round(
+              params.staleAfterMs / 60000,
+            )} min); holding new work until sensing resumes.`
+          : `stale: no governor decision recorded yet; holding new work until sensing resumes.`;
+    } else if (state === "RED") {
+      blocked = true;
+      ruleReason = `RED: ${decisionReason}`;
+    } else if (floorActive) {
+      blocked = true;
+      ruleReason = `floor: 5h utilization ${fiveHourPct}% >= floor_5h (${params.floor5h}%).`;
+    } else if (state === "AMBER" && projectClass === "P2") {
+      blocked = true;
+      ruleReason = `AMBER blocks P2 work: ${decisionReason}`;
+    } else {
+      blocked = false;
+      ruleReason = `${state ?? "GREEN"}: admitted (project class ${projectClass}).`;
+    }
+
+    const allowed = mode === "shadow" ? true : !blocked;
+    const reason =
+      mode === "shadow" && blocked ? `shadow: would block — ${ruleReason}` : ruleReason;
+
+    if (allowed) {
+      admissionCounters.allowed += 1;
+    } else {
+      admissionCounters.blocked += 1;
+      admissionCounters.lastBlock = { at: asOf, agentId: input.agentId, reason };
+    }
+    if (mode === "shadow" && blocked) {
+      admissionCounters.wouldBlock += 1;
+    }
+
+    return { allowed, mode, state, stale, reason, projectClass, wouldBlock: blocked };
+  }
+
+  return { senseOnce, evaluate, tick, start, getStatus, getAdmission };
 }
 
 /** Upserts a `fleet_settings` row. Shared by the settings PATCH route. */

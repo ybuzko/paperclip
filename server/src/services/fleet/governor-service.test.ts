@@ -1,10 +1,14 @@
+import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  companies,
   createDb,
   fleetLimitSnapshots,
   fleetSettings,
   fleetThrottleStates,
   getEmbeddedPostgresTestSupport,
+  projects,
   startEmbeddedPostgresTestDatabase,
 } from "@paperclipai/db";
 import type { ProviderQuotaResult } from "@paperclipai/shared";
@@ -64,7 +68,35 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
     await db.delete(fleetThrottleStates);
     await db.delete(fleetLimitSnapshots);
     await db.delete(fleetSettings);
+    await db.delete(projects);
+    await db.delete(companies);
   });
+
+  async function seedCompany(): Promise<string> {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Admission Test Co",
+      status: "active",
+      issuePrefix: companyId.slice(0, 8),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return companyId;
+  }
+
+  async function seedProject(companyId: string, fleetClass: "P0" | "P1" | "P2"): Promise<string> {
+    const projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: `Project ${fleetClass}`,
+      env: { FLEET_CLASS: { type: "plain", value: fleetClass } },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return projectId;
+  }
 
   afterAll(async () => {
     await stopDb?.();
@@ -315,6 +347,233 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
       expect(status.snapshots.length).toBeGreaterThan(0);
       expect(status.snapshots.every((snapshot) => snapshot.stale === false)).toBe(true);
       expect(status.nextDueAt.getTime()).toBeGreaterThan(now.getTime());
+      expect(status.admissionsAllowed).toBe(0);
+      expect(status.admissionsBlocked).toBe(0);
+      expect(status.admissionsWouldBlock).toBe(0);
+      expect(status.lastBlock).toBeNull();
+    });
+  });
+
+  describe("getAdmission", () => {
+    const NOW = new Date("2026-01-02T00:00:00.000Z");
+
+    /**
+     * Windows with elapsedFraction exactly 0.5 (well past the default
+     * minElapsedFraction, and — at weekly day 4 — right at the earliest day
+     * ACCELERATE can trigger, so callers should keep sevenDayPct's implied
+     * pace clearly above accel_pace (0.8) unless ACCELERATE is intended).
+     */
+    function quotaResult(opts: { fiveHourPct: number; sevenDayPct: number }): ProviderQuotaResult {
+      return {
+        provider: "anthropic",
+        source: "oauth_usage",
+        ok: true,
+        windows: [
+          { label: "Current session", key: "five_hour", usedPercent: opts.fiveHourPct, resetsAt: null, valueLabel: null, detail: null },
+          {
+            label: "Current week (all models)",
+            key: "seven_day",
+            usedPercent: opts.sevenDayPct,
+            resetsAt: "2026-01-05T12:00:00.000Z",
+            valueLabel: null,
+            detail: null,
+          },
+        ],
+      };
+    }
+
+    async function evaluatedService(opts: {
+      fiveHourPct: number;
+      sevenDayPct: number;
+      mode?: "shadow" | "enforce";
+    }) {
+      if (opts.mode) {
+        await db.insert(fleetSettings).values({
+          key: GOVERNOR_MODE_SETTINGS_KEY,
+          value: { mode: opts.mode },
+          version: "v1",
+          updatedAt: new Date(),
+          updatedBy: "test-admin",
+        });
+      }
+      const svc = createFleetGovernorService({
+        db,
+        logger: fakeLogger(),
+        fetchQuota: async () => [quotaResult(opts)],
+        now: () => NOW,
+      });
+      await svc.senseOnce();
+      await svc.evaluate();
+      return svc;
+    }
+
+    it("shadow mode: RED never blocks, but reports wouldBlock and the shadow reason", async () => {
+      const companyId = await seedCompany();
+      const svc = await evaluatedService({ fiveHourPct: 95, sevenDayPct: 40 }); // fresh 5h breach -> RED
+
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
+
+      expect(admission.state).toBe("RED");
+      expect(admission.mode).toBe("shadow");
+      expect(admission.allowed).toBe(true);
+      expect(admission.wouldBlock).toBe(true);
+      expect(admission.reason).toMatch(/^shadow: would block/);
+      expect(admission.reason).toMatch(/RED/);
+    });
+
+    it("enforce mode: RED blocks", async () => {
+      const companyId = await seedCompany();
+      const svc = await evaluatedService({ fiveHourPct: 95, sevenDayPct: 40, mode: "enforce" });
+
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
+
+      expect(admission.state).toBe("RED");
+      expect(admission.mode).toBe("enforce");
+      expect(admission.allowed).toBe(false);
+      expect(admission.wouldBlock).toBe(true);
+      expect(admission.reason).toMatch(/RED/);
+    });
+
+    it("enforce mode: the interactive floor blocks even under GREEN", async () => {
+      const companyId = await seedCompany();
+      // 5h at 85% (>= floor_5h 80, < red_5h 90); pace on-plan (45/50=0.9, above
+      // accel_pace so it doesn't ACCELERATE at weekly day 4) -> GREEN with floorActive.
+      const svc = await evaluatedService({ fiveHourPct: 85, sevenDayPct: 45, mode: "enforce" });
+
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
+
+      expect(admission.state).toBe("GREEN");
+      expect(admission.allowed).toBe(false);
+      expect(admission.reason).toMatch(/floor/i);
+    });
+
+    it("enforce mode: AMBER blocks P2 projects but allows P0/P1", async () => {
+      const companyId = await seedCompany();
+      const p0 = await seedProject(companyId, "P0");
+      const p1 = await seedProject(companyId, "P1");
+      const p2 = await seedProject(companyId, "P2");
+      // sevenDayPct 60 at elapsedFraction 0.5 -> pace 1.2 (between amber_pace and red_pace).
+      const svc = await evaluatedService({ fiveHourPct: 40, sevenDayPct: 60, mode: "enforce" });
+
+      const admissionP0 = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: p0 });
+      const admissionP1 = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: p1 });
+      const admissionP2 = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: p2 });
+
+      expect(admissionP0.state).toBe("AMBER");
+      expect(admissionP0.projectClass).toBe("P0");
+      expect(admissionP0.allowed).toBe(true);
+
+      expect(admissionP1.projectClass).toBe("P1");
+      expect(admissionP1.allowed).toBe(true);
+
+      expect(admissionP2.projectClass).toBe("P2");
+      expect(admissionP2.allowed).toBe(false);
+      expect(admissionP2.reason).toMatch(/AMBER/);
+    });
+
+    it("a project with no FLEET_CLASS set, or no projectId at all, defaults to P2", async () => {
+      const companyId = await seedCompany();
+      const untaggedProject = await seedProject(companyId, "P0");
+      // Overwrite env to omit FLEET_CLASS entirely.
+      await db.update(projects).set({ env: {} }).where(eq(projects.id, untaggedProject));
+      const svc = await evaluatedService({ fiveHourPct: 40, sevenDayPct: 50 }); // GREEN
+
+      const noProject = await svc.getAdmission({ companyId, agentId: "agent-1" });
+      const untagged = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: untaggedProject });
+
+      expect(noProject.projectClass).toBe("P2");
+      expect(untagged.projectClass).toBe("P2");
+    });
+
+    it("GREEN allows regardless of project class", async () => {
+      const companyId = await seedCompany();
+      const p2 = await seedProject(companyId, "P2");
+      const svc = await evaluatedService({ fiveHourPct: 40, sevenDayPct: 45, mode: "enforce" }); // GREEN
+
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: p2 });
+
+      expect(admission.state).toBe("GREEN");
+      expect(admission.allowed).toBe(true);
+      expect(admission.wouldBlock).toBe(false);
+    });
+
+    it("no decision yet (nothing sensed/evaluated) is stale and blocks in enforce mode", async () => {
+      const companyId = await seedCompany();
+      await db.insert(fleetSettings).values({
+        key: GOVERNOR_MODE_SETTINGS_KEY,
+        value: { mode: "enforce" },
+        version: "v1",
+        updatedAt: new Date(),
+        updatedBy: "test-admin",
+      });
+      const svc = createFleetGovernorService({ db, logger: fakeLogger(), now: () => NOW });
+
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
+
+      expect(admission.state).toBeNull();
+      expect(admission.stale).toBe(true);
+      expect(admission.allowed).toBe(false);
+      expect(admission.reason).toMatch(/stale/i);
+    });
+
+    it("falls back to the newest fleet_throttle_states row when there is no in-memory decision", async () => {
+      const companyId = await seedCompany();
+      await db.insert(fleetThrottleStates).values({
+        ts: NOW,
+        mode: "shadow",
+        state: "GREEN",
+        stale: false,
+        pace: 1.0,
+        fiveHourPct: 10,
+        sevenDayPct: 50,
+        floorActive: false,
+        reason: "GREEN: seeded row for DB-fallback test",
+        paramsVersion: DEFAULT_GOVERNOR_PARAMS.paramsVersion,
+        inputs: {},
+        launchParameters: {},
+      });
+      // Freshly constructed service: no senseOnce()/evaluate() call, so
+      // getAdmission() must fall back to the DB row above.
+      const svc = createFleetGovernorService({ db, logger: fakeLogger(), now: () => NOW });
+
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
+
+      expect(admission.state).toBe("GREEN");
+      expect(admission.stale).toBe(false);
+      expect(admission.allowed).toBe(true);
+    });
+
+    it("a decision older than staleAfterMs is treated as stale even when cached in-memory", async () => {
+      const companyId = await seedCompany();
+      let clock = NOW;
+      const svc = createFleetGovernorService({
+        db,
+        logger: fakeLogger(),
+        fetchQuota: async () => [quotaResult({ fiveHourPct: 40, sevenDayPct: 40 })],
+        now: () => clock,
+      });
+      await svc.senseOnce();
+      await svc.evaluate();
+
+      clock = new Date(NOW.getTime() + DEFAULT_GOVERNOR_PARAMS.staleAfterMs + 1);
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
+
+      expect(admission.stale).toBe(true);
+      expect(admission.reason).toMatch(/stale/i);
+    });
+
+    it("updates getStatus() admission counters and lastBlock", async () => {
+      const companyId = await seedCompany();
+      const svc = await evaluatedService({ fiveHourPct: 95, sevenDayPct: 40, mode: "enforce" }); // RED
+
+      await svc.getAdmission({ companyId, agentId: "agent-allowed-would-not-apply" }); // blocked (RED)
+      await svc.getAdmission({ companyId, agentId: "agent-2" }); // blocked (RED)
+
+      const status = await svc.getStatus();
+      expect(status.admissionsBlocked).toBe(2);
+      expect(status.admissionsAllowed).toBe(0);
+      expect(status.lastBlock).toMatchObject({ agentId: "agent-2" });
+      expect(status.lastBlock?.reason).toMatch(/RED/);
     });
   });
 });
