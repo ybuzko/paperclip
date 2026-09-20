@@ -204,21 +204,35 @@ describe("decideDispatch", () => {
     expect(result.nudge).toBe(true);
   });
 
-  it("respects the backoff delay at level 1 (60 min) even after minNudgeGap has passed", () => {
+  it("holds a stuck level-0 nudge for the first backoff delay (60 min) without escalating per poll", () => {
+    const fp = countsFingerprint({ readyTasks: 1, epicsToExplode: 0, epicsToClose: 0 });
     const result = decideDispatch(
       baseInput({
-        lastNudgeAt: new Date(NOW.getTime() - 30 * 60 * 1000), // 30 min ago: past the 15 min gap, short of 60 min backoff
-        backoffLevel: 1,
-        // A different fingerprint than the current counts, so this tick does not
-        // escalate to needs_human -- it should be gated by the backoff delay instead.
-        previousCountsFingerprint: countsFingerprint({ readyTasks: 999, epicsToExplode: 0, epicsToClose: 0 }),
+        lastNudgeAt: new Date(NOW.getTime() - 30 * 60 * 1000), // past the 15 min gap, short of the 60 min backoff
+        backoffLevel: 0,
+        previousCountsFingerprint: fp,
       }),
     );
     expect(result.nudge).toBe(false);
     expect(result.reason).toContain("backoff");
+    expect(result.nextBackoffLevel).toBe(0);
   });
 
-  it("nudges again once the level-1 backoff delay (60 min) has elapsed", () => {
+  it("holds a stuck level-1 nudge for the second backoff delay (6 h)", () => {
+    const fp = countsFingerprint({ readyTasks: 1, epicsToExplode: 0, epicsToClose: 0 });
+    const result = decideDispatch(
+      baseInput({
+        lastNudgeAt: new Date(NOW.getTime() - 61 * 60 * 1000),
+        backoffLevel: 1,
+        previousCountsFingerprint: fp,
+      }),
+    );
+    expect(result.nudge).toBe(false);
+    expect(result.reason).toContain("backoff");
+    expect(result.nextBackoffLevel).toBe(1);
+  });
+
+  it("nudges again and resets the level once the counts change", () => {
     const result = decideDispatch(
       baseInput({
         lastNudgeAt: new Date(NOW.getTime() - 61 * 60 * 1000),
@@ -228,9 +242,10 @@ describe("decideDispatch", () => {
       }),
     );
     expect(result.nudge).toBe(true);
+    expect(result.nextBackoffLevel).toBe(0);
   });
 
-  it("escalates backoff to level 1 when the previous nudge went unacked and counts are unchanged", () => {
+  it("re-nudges and escalates to level 1 once a stuck nudge has waited out the first backoff delay", () => {
     const fp = countsFingerprint({ readyTasks: 1, epicsToExplode: 0, epicsToClose: 0 });
     const result = decideDispatch(
       baseInput({
@@ -240,6 +255,7 @@ describe("decideDispatch", () => {
         lastAckAt: null,
       }),
     );
+    expect(result.nudge).toBe(true);
     expect(result.nextBackoffLevel).toBe(1);
   });
 
@@ -280,7 +296,7 @@ describe("decideDispatch", () => {
         lastAckAt: new Date(lastNudgeAt.getTime() - 60 * 1000), // before the nudge, stale ack
       }),
     );
-    expect(result.nextBackoffLevel).toBe(2);
+    expect(result.nextBackoffLevel).toBe(1);
   });
 
   it("caps backoff escalation at maxBackoffLevel and reports needs_human once capped and still stuck", () => {

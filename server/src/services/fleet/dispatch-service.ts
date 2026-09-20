@@ -674,7 +674,9 @@ export function createFleetDispatchService(deps: FleetDispatchServiceDeps): Flee
       dispatchIssueId,
       lastPollAt: asOf,
       counts,
-      fingerprint,
+      // The fingerprint is the counts as of the last nudge, so the policy can tell
+      // whether anything moved since; polls between nudges leave it alone.
+      fingerprint: nudged || !existing?.countsFingerprint ? fingerprint : existing.countsFingerprint,
       decision,
       lastNudgeAt,
       lastNudgeWakeId,

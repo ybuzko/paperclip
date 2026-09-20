@@ -71,28 +71,32 @@ per-run admission class (`./types.ts`'s `ProjectClass`).
    governor's `FR-4.6`) → no nudge.
 6. **Governor AMBER** → nudge only `P0`/`P1` projects.
 7. **GREEN / ACCELERATE** → nudge (subject to the gaps below).
-8. **`needs_human`**: once backoff is at `maxBackoffLevel` and the previous
-   nudge got no ack while the ready-work counts stayed unchanged → no nudge,
-   `reason: "needs_human"`. A human has to look, or the counts have to move,
-   or an ack has to land.
-9. **`min_nudge_gap`**: never nudge the same project twice within
+8. **`min_nudge_gap`**: never nudge the same project twice within
    `minNudgeGapMs` (default 15 min) of the last nudge.
-10. **`backoff`**: while `backoffLevel > 0`, also wait at least
-    `backoffMs[backoffLevel - 1]` since the last nudge (default: 60 min at
-    level 1, 360 min at level 2, `maxBackoffLevel = 2`).
+9. **`backoff`**: if the last nudge is *stuck* (no ack since, counts
+   unchanged since it was sent), wait `backoffMs[backoffLevel]` before the
+   next nudge (default: 60 min at level 0, 360 min at level 1). Sending that
+   next nudge raises the level by one.
+10. **`needs_human`**: a stuck nudge at `maxBackoffLevel` (default 2) → no
+    nudge, `reason: "needs_human"`, until the counts move or an ack lands.
 
 Steps 1–10 are pure and unit-tested in `./dispatch-policy.test.ts`
 independent of the DB/Jira/wakeup I/O in `./dispatch-service.test.ts`.
 
 ### Backoff
 
-Backoff tracks "is anyone home". Every tick recomputes `nextBackoffLevel`
-from the *previous* nudge, regardless of whether this tick itself nudges:
+Backoff tracks "is anyone home". A nudge is *stuck* when no ack has landed
+since it was sent and the ready-work counts fingerprint
+(`readyTasks:epicsToExplode:epicsToClose`) equals the one recorded when it was
+sent (`counts_fingerprint` is only rewritten on a nudge).
 
-- an ack observed at/after the last nudge → level resets to 0;
-- otherwise, if the ready-work counts fingerprint (`readyTasks:epicsToExplode:epicsToClose`)
-  is unchanged since the last nudge → level increases by 1, capped at
-  `maxBackoffLevel`.
+- an ack at/after the last nudge, or any change in the counts → level resets to 0;
+- the level rises only when a stuck nudge has waited out its delay and the
+  next nudge goes out — once per nudge, never per poll, so the delays hold at
+  any `pollIntervalMs`.
+
+Default sequence with a silent supervisor: nudge → 60 min → nudge → 6 h →
+nudge → `needs_human`.
 
 An ack from *before* the last nudge (a stale ack left over from an earlier
 cycle) does not reset backoff — only an ack timestamped at/after

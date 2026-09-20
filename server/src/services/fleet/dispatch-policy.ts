@@ -173,16 +173,12 @@ export function decideDispatch(input: DecideDispatchInput): DecideDispatchResult
   const countsUnchangedSinceLastNudge =
     input.previousCountsFingerprint != null && input.previousCountsFingerprint === fingerprint;
 
-  // Backoff bookkeeping happens regardless of whether we nudge this tick: an
-  // ack (after the last nudge) always resets the level; otherwise it
-  // escalates only when the previous nudge produced no ack AND the counts
-  // fingerprint hasn't changed since.
-  let nextBackoffLevel = input.backoffLevel;
-  if (ackedSinceLastNudge) {
-    nextBackoffLevel = 0;
-  } else if (lastNudgeAt != null && countsUnchangedSinceLastNudge) {
-    nextBackoffLevel = Math.min(params.maxBackoffLevel, input.backoffLevel + 1);
-  }
+  // An un-acked nudge whose counts have not moved since it was sent is "stuck".
+  // The level rises once per stuck nudge (when the next nudge is sent), never
+  // per poll, so the backoff delays hold at any poll interval. An ack or a
+  // change in the counts resets the level.
+  const stuck = lastNudgeAt != null && !ackedSinceLastNudge && countsUnchangedSinceLastNudge;
+  let nextBackoffLevel = lastNudgeAt != null && !stuck ? 0 : input.backoffLevel;
 
   if (!hasWork) {
     return { nudge: false, reason: "no_work: no ready tasks, epics to explode, or epics to close", nextBackoffLevel };
@@ -216,17 +212,6 @@ export function decideDispatch(input: DecideDispatchInput): DecideDispatchResult
     };
   }
 
-  // At the cap, a further un-acked, unchanged-counts poll needs a human --
-  // the loop stops nudging until the counts change or someone acks.
-  if (
-    nextBackoffLevel >= params.maxBackoffLevel &&
-    lastNudgeAt != null &&
-    !ackedSinceLastNudge &&
-    countsUnchangedSinceLastNudge
-  ) {
-    return { nudge: false, reason: "needs_human", nextBackoffLevel };
-  }
-
   if (lastNudgeAt != null) {
     const elapsedSinceNudge = now.getTime() - lastNudgeAt.getTime();
     if (elapsedSinceNudge < params.minNudgeGapMs) {
@@ -236,18 +221,22 @@ export function decideDispatch(input: DecideDispatchInput): DecideDispatchResult
         nextBackoffLevel,
       };
     }
-    if (input.backoffLevel > 0) {
+    if (stuck) {
+      // Every backoff step has been tried without an ack or any movement --
+      // stop nudging until the counts change or someone acks.
+      if (input.backoffLevel >= params.maxBackoffLevel) {
+        return { nudge: false, reason: "needs_human", nextBackoffLevel };
+      }
       const backoffDelay =
-        params.backoffMs[Math.min(input.backoffLevel, params.backoffMs.length) - 1] ??
-        params.backoffMs[params.backoffMs.length - 1] ??
-        0;
+        params.backoffMs[Math.min(input.backoffLevel, params.backoffMs.length - 1)] ?? 0;
       if (elapsedSinceNudge < backoffDelay) {
         return {
           nudge: false,
-          reason: `backoff: at level ${input.backoffLevel}, only ${Math.round(elapsedSinceNudge / 1000)}s since the last nudge (min ${Math.round(backoffDelay / 1000)}s)`,
+          reason: `backoff: level ${input.backoffLevel}, only ${Math.round(elapsedSinceNudge / 1000)}s since the un-acked nudge (min ${Math.round(backoffDelay / 1000)}s)`,
           nextBackoffLevel,
         };
       }
+      nextBackoffLevel = input.backoffLevel + 1;
     }
   }
 

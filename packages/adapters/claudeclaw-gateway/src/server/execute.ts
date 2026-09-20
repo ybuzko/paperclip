@@ -308,7 +308,7 @@ export function buildFleetDispatchBlock(dispatch: FleetDispatch): string {
     `Fleet dispatch — the governor allows work (state ${dispatch.throttleState}, 5h window ${formatFleetPct(dispatch.fiveHourPct)}, 7-day window ${formatFleetPct(dispatch.sevenDayPct)}, resets ${formatFleetResetDate(dispatch.sevenDayResetsAt)}).`,
     `Jira ${dispatch.jiraProject} currently has assigned to you: ${readyTasks} ready tasks (To Do / In Progress), ${epicsToExplode} epics in To Do to review and break down, ${epicsToClose} epics in In Progress whose children are all complete${closeKeysSuffix}.`,
     "Pick ONE item and work it to completion in this turn: a task → work it including your usual evaluation; an epic in To Do → review it, break it into tasks assigned to yourself, then move the epic to In Progress; an epic to close → review the outcome and close it (or reopen work).",
-    "If an item cannot be worked, reassign it to the human with a comment stating the blocker. Do not start a second item.",
+    "Your queue holds only items you can advance. If an item cannot be worked, or your part is done and what remains needs the human (verification, a deploy, access, a decision), reassign it to the human with a comment stating what is waiting on them. Never keep a ticket that is waiting on the human. Do not start a second item.",
     ...(dispatch.throttleState === "AMBER" ? ["Budget is tight: prefer the smallest ready item."] : []),
     `End this turn by posting exactly one comment on this dispatch issue that contains the line: ${dispatch.ackFormat}.`,
   ];
