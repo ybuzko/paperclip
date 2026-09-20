@@ -68,6 +68,13 @@ function decide(overrides: Partial<Parameters<typeof decideSuccessfulRunHandoff>
 }
 
 describe("successful run handoff decision", () => {
+  it("skips fleet dispatch nudges: the dispatch loop owns the standing issue's next action", () => {
+    const decision = decide({
+      run: { ...run, contextSnapshot: { ...(run.contextSnapshot ?? {}), wakeReason: "fleet_dispatch" } } as any,
+    });
+    expect(decision).toEqual({ kind: "skip", reason: "fleet dispatch loop owns the next action" });
+  });
+
   it("queues one normal-model corrective wake to the original agent when a successful run has no disposition", () => {
     const decision = decide();
 

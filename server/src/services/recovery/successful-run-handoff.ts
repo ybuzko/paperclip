@@ -344,6 +344,19 @@ function isIssueMonitorMaintenanceRun(run: HeartbeatRunRow) {
   return Boolean(wakeReason?.startsWith("issue_monitor") || source?.startsWith("issue.monitor"));
 }
 
+// A fleet dispatch nudge (see services/fleet/dispatch-service.ts) is a turn on a
+// standing per-project issue that is meant to stay in_progress forever: the loop
+// re-polls Jira and wakes the supervisor again when there is more work, so the
+// issue never needs a disposition. Without this skip every nudge would be followed
+// by a corrective handoff wake (a wasted supervisor turn) and then the stranded-
+// issue escalation would mark the standing issue blocked.
+export const FLEET_DISPATCH_WAKE_REASON = "fleet_dispatch";
+
+function isFleetDispatchRun(run: HeartbeatRunRow) {
+  const context = readRecord(run.contextSnapshot);
+  return readString(context.wakeReason) === FLEET_DISPATCH_WAKE_REASON;
+}
+
 function isCommentDrivenWake(run: HeartbeatRunRow) {
   const context = readRecord(run.contextSnapshot);
   const wakeReason = readString(context.wakeReason);
@@ -459,6 +472,7 @@ export function decideSuccessfulRunHandoff(input: {
   if (isRecoveryActionDrivenRun(run)) return { kind: "skip", reason: "recovery action run owns its own follow-up path" };
   if (isIssueMonitorMaintenanceRun(run)) return { kind: "skip", reason: "issue monitor run owns its own recovery path" };
   if (isCommentDrivenWake(run)) return { kind: "skip", reason: "comment-driven wake already owns the next action" };
+  if (isFleetDispatchRun(run)) return { kind: "skip", reason: "fleet dispatch loop owns the next action" };
   if (run.issueCommentStatus === "retry_queued" || run.issueCommentStatus === "retry_exhausted") {
     return { kind: "skip", reason: "missing issue comment retry owns the next action" };
   }
