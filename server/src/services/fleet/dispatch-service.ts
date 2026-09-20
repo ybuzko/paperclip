@@ -61,6 +61,12 @@ export const DISPATCH_MODE_SETTINGS_KEY = "dispatch_mode";
 export const DISPATCH_PARAMS_SETTINGS_KEY = "dispatch_params";
 
 const DEFAULT_POLL_INTERVAL_MS = 10 * 60 * 1000;
+/**
+ * issues.origin_kind for the standing dispatch issue. Paperclip's recovery paths
+ * (issue continuation, successful-run handoff, stranded-issue escalation) treat this
+ * origin as externally managed and leave the issue alone; see recovery/origins.ts.
+ */
+export const DISPATCH_ISSUE_ORIGIN_KIND = "fleet_dispatch";
 
 /** `fleet-ack:` line format the dispatch issue's description asks the supervisor to reply with. */
 export const FLEET_ACK_FORMAT =
@@ -397,16 +403,20 @@ export function createFleetDispatchService(deps: FleetDispatchServiceDeps): Flee
     const asOf = now();
     if (existingIssueId) {
       const existing = await deps.db
-        .select({ id: issues.id, status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+        .select({ id: issues.id, status: issues.status, assigneeAgentId: issues.assigneeAgentId, originKind: issues.originKind })
         .from(issues)
         .where(eq(issues.id, existingIssueId))
         .limit(1)
         .then((rows) => rows[0] ?? null);
       if (existing) {
-        if (existing.status !== "in_progress" || existing.assigneeAgentId !== project.leadAgentId) {
+        if (
+          existing.status !== "in_progress" ||
+          existing.assigneeAgentId !== project.leadAgentId ||
+          existing.originKind !== DISPATCH_ISSUE_ORIGIN_KIND
+        ) {
           await deps.db
             .update(issues)
-            .set({ status: "in_progress", assigneeAgentId: project.leadAgentId, updatedAt: asOf })
+            .set({ status: "in_progress", assigneeAgentId: project.leadAgentId, originKind: DISPATCH_ISSUE_ORIGIN_KIND, updatedAt: asOf })
             .where(eq(issues.id, existing.id));
         }
         return existing.id;
@@ -419,6 +429,7 @@ export function createFleetDispatchService(deps: FleetDispatchServiceDeps): Flee
       projectId: project.id,
       assigneeAgentId: project.leadAgentId,
       status: "in_progress",
+      originKind: DISPATCH_ISSUE_ORIGIN_KIND,
     });
     return created.id;
   }

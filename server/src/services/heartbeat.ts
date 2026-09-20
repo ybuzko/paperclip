@@ -17793,6 +17793,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "released" as const };
       }
 
+      // The fleet dispatch loop's standing issue stays in_progress on purpose; the loop
+      // re-polls Jira and wakes the supervisor itself. Never queue continuation recovery
+      // or block it as stranded.
+      if (issue.originKind === RECOVERY_ORIGIN_KINDS.fleetDispatch) {
+        return { kind: "released" as const };
+      }
+
       if (issue.originKind === RECOVERY_ORIGIN_KINDS.strandedIssueRecovery) {
         return {
           kind: "blocked_recovery_in_place" as const,

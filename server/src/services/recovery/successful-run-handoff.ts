@@ -62,7 +62,10 @@ export function isIdempotentFinishSuccessfulRunHandoffWakeStatus(status: string)
  * plugin-managed issues to the plugin's own recovery/enforcement path instead.
  */
 export function isPluginManagedIssueLifecycle(issue: { originKind?: string | null }) {
-  return Boolean(issue.originKind?.startsWith("plugin:"));
+  // Plugins own the lifecycle of the issues they create, and so does the fleet dispatch
+  // loop for its standing per-project issue: it stays in_progress by design and the loop,
+  // not a corrective wake, decides the next action.
+  return Boolean(issue.originKind?.startsWith("plugin:")) || issue.originKind === "fleet_dispatch";
 }
 
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
@@ -488,7 +491,7 @@ export function decideSuccessfulRunHandoff(input: {
   if (issue.status !== "in_progress") return { kind: "skip", reason: `issue status ${issue.status} is a valid disposition` };
   if (issue.executionState) return { kind: "skip", reason: "issue has execution policy state" };
   if (isPluginManagedIssueLifecycle(issue)) {
-    return { kind: "skip", reason: "issue lifecycle is owned by a plugin" };
+    return { kind: "skip", reason: issue.originKind === "fleet_dispatch" ? "fleet dispatch loop owns the standing issue" : "issue lifecycle is owned by a plugin" };
   }
   if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
     return { kind: "skip", reason: `agent status ${agent.status} is not invokable` };
