@@ -9,10 +9,11 @@ import { accessService } from "./access.js";
  * Scoped agent provisioning (PIX-19).
  *
  * A board user may give an agent the `agents:provision` grant. The grant applies to every key
- * the agent holds (no heartbeat run id needed) and its scope bounds what the agent can do:
- * create agents of the listed adapter types under a forced manager, mint each new agent's
- * API key once, and create / rotate / bind company secrets under a name prefix, only for
- * agents it provisioned itself. It never grants secret reads or board access.
+ * the agent holds (no heartbeat run id needed). It lets the agent create agents of any adapter
+ * type, mint each new agent's API key once, and create / rotate / bind company secrets. The
+ * bound is provenance: keys and bindings only for agents it provisioned, rotation and binding
+ * only for secrets it created. It never grants secret reads or board access. The optional
+ * scope can force the manager (reportsTo) of provisioned agents.
  *
  * Provenance lives in agents.metadata[PROVISIONED_BY_METADATA_KEY] = the provisioning agent id.
  */
@@ -48,8 +49,8 @@ export function agentProvisioningService(db: Db) {
       )
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
-    // A grant with a missing or malformed scope is treated as no grant: fail closed.
-    const parsed = agentProvisionGrantScopeSchema.safeParse(row.scope);
+    // No scope means no extra restrictions; a malformed scope is treated as no grant (fail closed).
+    const parsed = agentProvisionGrantScopeSchema.safeParse(row.scope ?? {});
     if (!parsed.success) return null;
     return { scope: parsed.data, grantedByUserId: row.grantedByUserId ?? null, updatedAt: row.updatedAt };
   }
@@ -97,11 +98,5 @@ export function agentProvisioningService(db: Db) {
     return rows[0]?.n ?? 0;
   }
 
-  function assertSecretNameAllowed(scope: AgentProvisionGrantScope, name: string) {
-    if (!name.startsWith(scope.secretNamePrefix)) {
-      throw forbidden(`Secret name must start with ${scope.secretNamePrefix}`);
-    }
-  }
-
-  return { getGrant, setGrant, clearGrant, requireGrantForActor, isProvisionedBy, countProvisionedBy, assertSecretNameAllowed };
+  return { getGrant, setGrant, clearGrant, requireGrantForActor, isProvisionedBy, countProvisionedBy };
 }

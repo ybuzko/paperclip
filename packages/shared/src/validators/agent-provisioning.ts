@@ -2,22 +2,21 @@ import { z } from "zod";
 
 /**
  * Scope carried by the `agents:provision` grant. The grant lets an agent provision other
- * agents and their secrets without board access; the scope is what bounds the blast radius.
+ * agents (any adapter type) and their secrets without board access. The blast radius is bounded
+ * by provenance, not by the scope: the grantee can only mint a key for, bind secrets to, and
+ * rotate secrets of agents and secrets it created itself, and can never read a secret value.
  */
 export const agentProvisionGrantScopeSchema = z.object({
-  /** Adapter types the grantee may create agents for, e.g. ["claudeclaw_gateway"]. */
-  adapterTypes: z.array(z.string().trim().min(1)).min(1).max(16),
-  /** Every provisioned agent reports to this agent (the coordinator); null = no manager. */
-  reportsTo: z.string().guid().nullable(),
-  /** Secrets the grantee may create, rotate and bind must have a name starting with this. */
-  secretNamePrefix: z.string().trim().min(3).max(120),
-  /** Optional cap on the number of agents this grantee may have provisioned at once. */
-  maxAgents: z.number().int().min(1).max(1000).optional(),
+  /**
+   * Optional. When set, every provisioned agent reports to this agent and the caller cannot
+   * choose another manager. When absent the caller may pass reportsTo itself.
+   */
+  reportsTo: z.string().guid().nullable().optional(),
 });
 export type AgentProvisionGrantScope = z.infer<typeof agentProvisionGrantScopeSchema>;
 
 export const setAgentProvisionGrantSchema = z.discriminatedUnion("enabled", [
-  z.object({ enabled: z.literal(true), scope: agentProvisionGrantScopeSchema }),
+  z.object({ enabled: z.literal(true), scope: agentProvisionGrantScopeSchema.default({}) }),
   z.object({ enabled: z.literal(false) }),
 ]);
 export type SetAgentProvisionGrant = z.infer<typeof setAgentProvisionGrantSchema>;
@@ -28,6 +27,8 @@ export const provisionAgentSchema = z.object({
   adapterConfig: z.record(z.string(), z.unknown()).default({}),
   title: z.string().trim().max(200).optional(),
   capabilities: z.string().trim().max(4000).optional(),
+  /** Manager for the new agent; ignored when the grant scope forces one. */
+  reportsTo: z.string().guid().nullable().optional(),
   /** Label for the API key minted for the new agent. */
   keyName: z.string().trim().min(1).max(120).default("provisioned"),
 });

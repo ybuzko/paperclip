@@ -66,9 +66,7 @@ describeEmbeddedPostgres("agent provisioning secret routes", () => {
   });
 
   const GRANT_SCOPE = {
-    adapterTypes: ["claudeclaw_gateway"],
     reportsTo: null as string | null,
-    secretNamePrefix: "ansible/",
   };
 
   async function seedCompany() {
@@ -210,17 +208,6 @@ describeEmbeddedPostgres("agent provisioning secret routes", () => {
 
     const [row] = await db.select().from(companySecrets).where(eq(companySecrets.id, first.body.id));
     expect(row.latestVersion).toBe(2);
-  });
-
-  it("rejects a secret name outside the grant's prefix with 403", async () => {
-    const companyId = await seedCompany();
-    const actorAgentId = await seedAnsibleAgent(companyId);
-
-    const res = await provisionSecret(companyId, actorAgentId, "not-allowed/host1-token");
-
-    expect(res.status).toBe(403);
-    const [row] = await db.select().from(companySecrets);
-    expect(row).toBeUndefined();
   });
 
   it("rejects an agent with no agents:provision grant with 403", async () => {

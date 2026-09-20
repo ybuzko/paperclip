@@ -114,10 +114,7 @@ describeEmbeddedPostgres("agent provisioning routes", () => {
     companyId: string,
     agentId: string,
     scope: {
-      adapterTypes: string[];
       reportsTo: string | null;
-      secretNamePrefix: string;
-      maxAgents?: number;
     },
   ) {
     await db.insert(principalPermissionGrants).values({
@@ -142,20 +139,14 @@ describeEmbeddedPostgres("agent provisioning routes", () => {
     ).send({
       enabled: true,
       scope: {
-        adapterTypes: ["process", "claude_local"],
         reportsTo: managerId,
-        secretNamePrefix: "prov_",
-        maxAgents: 3,
       },
     });
     expect(putRes.status, JSON.stringify(putRes.body)).toBe(200);
     expect(putRes.body).toMatchObject({
       enabled: true,
       scope: {
-        adapterTypes: ["process", "claude_local"],
         reportsTo: managerId,
-        secretNamePrefix: "prov_",
-        maxAgents: 3,
       },
       grantedByUserId: "board-user",
       provisionedAgentCount: 0,
@@ -194,9 +185,7 @@ describeEmbeddedPostgres("agent provisioning routes", () => {
     ).send({
       enabled: true,
       scope: {
-        adapterTypes: ["process"],
         reportsTo: randomUUID(),
-        secretNamePrefix: "prov_",
       },
     });
     expect(res.status, JSON.stringify(res.body)).toBe(422);
@@ -210,7 +199,7 @@ describeEmbeddedPostgres("agent provisioning routes", () => {
     const putRes = await withActor(
       request(app).put(`/api/agents/${ceoId}/provision-grant`),
       agentActor(ceoId, companyId),
-    ).send({ enabled: true, scope: { adapterTypes: ["process"], reportsTo: null, secretNamePrefix: "prov_" } });
+    ).send({ enabled: true, scope: { reportsTo: null } });
     expect(putRes.status).toBe(403);
 
     const getRes = await withActor(
@@ -225,9 +214,7 @@ describeEmbeddedPostgres("agent provisioning routes", () => {
     const provisionerId = await seedAgent(companyId, { name: "Ansible" });
     const managerId = await seedAgent(companyId, { name: "Coordinator" });
     await grantProvision(companyId, provisionerId, {
-      adapterTypes: ["process"],
       reportsTo: managerId,
-      secretNamePrefix: "prov_",
     });
     const app = createApp();
 
@@ -276,24 +263,25 @@ describeEmbeddedPostgres("agent provisioning routes", () => {
     expect(JSON.stringify(activityRows[0]?.details)).not.toContain(res.body.apiKey.token);
   });
 
-  it("rejects an adapter type outside the grant scope with 403", async () => {
+  it("with an unrestricted grant provisions any known adapter type and lets the caller choose reportsTo", async () => {
     const companyId = await seedCompany();
     const provisionerId = await seedAgent(companyId, { name: "Ansible" });
-    await grantProvision(companyId, provisionerId, {
-      adapterTypes: ["process"],
-      reportsTo: null,
-      secretNamePrefix: "prov_",
-    });
+    const managerId = await seedAgent(companyId, { name: "Coordinator" });
     const app = createApp();
+
+    const grantRes = await withActor(
+      request(app).put(`/api/agents/${provisionerId}/provision-grant`),
+      boardActor(),
+    ).send({ enabled: true });
+    expect(grantRes.status, JSON.stringify(grantRes.body)).toBe(200);
 
     const res = await withActor(
       request(app).post(`/api/companies/${companyId}/agents/provision`),
       agentActor(provisionerId, companyId),
-    ).send({ name: "Out Of Scope", adapterType: "claude_local", adapterConfig: {} });
-
-    expect(res.status, JSON.stringify(res.body)).toBe(403);
-    const created = await db.select().from(agents).where(eq(agents.name, "Out Of Scope"));
-    expect(created).toHaveLength(0);
+    ).send({ name: "Any Adapter", adapterType: "process", adapterConfig: {}, reportsTo: managerId });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.agent.reportsTo).toBe(managerId);
+    expect(typeof res.body.apiKey.token).toBe("string");
   });
 
   it("rejects provisioning with no grant", async () => {
@@ -322,39 +310,11 @@ describeEmbeddedPostgres("agent provisioning routes", () => {
     expect(res.body.error).toContain("/api/companies/:companyId/agents");
   });
 
-  it("enforces maxAgents with a 409", async () => {
-    const companyId = await seedCompany();
-    const provisionerId = await seedAgent(companyId, { name: "Ansible" });
-    await grantProvision(companyId, provisionerId, {
-      adapterTypes: ["process"],
-      reportsTo: null,
-      secretNamePrefix: "prov_",
-      maxAgents: 1,
-    });
-    // Pre-seed one agent already provisioned by this actor, at the cap.
-    await seedAgent(companyId, {
-      name: "Already Provisioned",
-      metadata: { [PROVISIONED_BY_METADATA_KEY]: provisionerId },
-    });
-    const app = createApp();
-
-    const res = await withActor(
-      request(app).post(`/api/companies/${companyId}/agents/provision`),
-      agentActor(provisionerId, companyId),
-    ).send({ name: "One Too Many", adapterType: "process", adapterConfig: {} });
-
-    expect(res.status, JSON.stringify(res.body)).toBe(409);
-    const created = await db.select().from(agents).where(eq(agents.name, "One Too Many"));
-    expect(created).toHaveLength(0);
-  });
-
   it("is idempotent: a retry mints the key once, then 409s on a second attempt, and never double-creates", async () => {
     const companyId = await seedCompany();
     const provisionerId = await seedAgent(companyId, { name: "Ansible" });
     await grantProvision(companyId, provisionerId, {
-      adapterTypes: ["process"],
       reportsTo: null,
-      secretNamePrefix: "prov_",
     });
     // Simulate a crash between agent creation and key minting: the agent row
     // exists, provisioned by this actor, but has no API key yet.
@@ -390,9 +350,7 @@ describeEmbeddedPostgres("agent provisioning routes", () => {
     const companyId = await seedCompany();
     const provisionerId = await seedAgent(companyId, { name: "Ansible" });
     await grantProvision(companyId, provisionerId, {
-      adapterTypes: ["process"],
       reportsTo: null,
-      secretNamePrefix: "prov_",
     });
     await seedAgent(companyId, { name: "Board Made Me" }); // no PROVISIONED_BY metadata
     const app = createApp();
@@ -408,14 +366,13 @@ describeEmbeddedPostgres("agent provisioning routes", () => {
   it("fails closed on a malformed stored grant scope", async () => {
     const companyId = await seedCompany();
     const provisionerId = await seedAgent(companyId, { name: "Ansible" });
-    // Insert a grant row with a scope that fails the zod schema (missing
-    // required fields) directly, bypassing the PUT route's validation.
+    // Insert a grant row with a scope that fails the zod schema (wrong type) directly, bypassing the PUT route's validation.
     await db.insert(principalPermissionGrants).values({
       companyId,
       principalType: "agent",
       principalId: provisionerId,
       permissionKey: AGENT_PROVISION_PERMISSION_KEY,
-      scope: { adapterTypes: [] },
+      scope: { reportsTo: 12345 },
       grantedByUserId: "board-user",
     });
     const app = createApp();
@@ -434,9 +391,7 @@ describeEmbeddedPostgres("agent provisioning routes", () => {
     const companyId = await seedCompany();
     const provisionerId = await seedAgent(companyId, { name: "Ansible" });
     await grantProvision(companyId, provisionerId, {
-      adapterTypes: ["process"],
       reportsTo: null,
-      secretNamePrefix: "prov_",
     });
     const app = createApp();
     const actor = agentActor(provisionerId, companyId);

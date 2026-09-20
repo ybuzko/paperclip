@@ -146,9 +146,6 @@ export function agentProvisioningRoutes(db: Db) {
 
       const body = req.body as ProvisionAgent;
 
-      if (!scope.adapterTypes.includes(body.adapterType)) {
-        throw forbidden(`Adapter type "${body.adapterType}" is not permitted by this grant`);
-      }
       const adapterType = assertKnownAdapterType(body.adapterType);
 
       const actor = getActorInfo(req);
@@ -222,11 +219,14 @@ export function agentProvisioningRoutes(db: Db) {
         );
       }
 
-      if (scope.maxAgents != null) {
-        const count = await provisioning.countProvisionedBy(companyId, actorAgentId);
-        if (count >= scope.maxAgents) {
-          throw conflict(`This grant is capped at ${scope.maxAgents} provisioned agent(s)`);
+      // The grant scope may force the manager; otherwise the caller chooses one in its company.
+      let reportsTo: string | null = scope.reportsTo ?? null;
+      if (!scope.reportsTo && body.reportsTo) {
+        const manager = await svc.getById(body.reportsTo);
+        if (!manager || manager.companyId !== companyId) {
+          throw unprocessable("reportsTo must reference an agent in the same company");
         }
+        reportsTo = manager.id;
       }
 
       const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
@@ -256,7 +256,7 @@ export function agentProvisioningRoutes(db: Db) {
         name: body.name,
         role: "general",
         title: body.title ?? null,
-        reportsTo: scope.reportsTo,
+        reportsTo,
         capabilities: body.capabilities ?? null,
         adapterType,
         adapterConfig: normalizedAdapterConfig,

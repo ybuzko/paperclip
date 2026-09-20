@@ -109,8 +109,7 @@ export function agentProvisioningSecretRoutes(db: Db) {
     async (req, res) => {
       assertAgentActor(req);
       const companyId = req.params.companyId as string;
-      const { actorAgentId, scope } = await provisioning.requireGrantForActor(req.actor, companyId);
-      provisioning.assertSecretNameAllowed(scope, req.body.name);
+      const { actorAgentId } = await provisioning.requireGrantForActor(req.actor, companyId);
 
       const actorInfo = getActorInfo(req);
       const name = req.body.name as string;
@@ -191,7 +190,7 @@ export function agentProvisioningSecretRoutes(db: Db) {
       const target = await agentsSvc.getById(targetAgentId);
       if (!target) throw notFound("Agent not found");
 
-      const { actorAgentId, scope } = await provisioning.requireGrantForActor(req.actor, target.companyId);
+      const { actorAgentId } = await provisioning.requireGrantForActor(req.actor, target.companyId);
 
       if (!provisioning.isProvisionedBy(target, actorAgentId)) {
         throw forbidden("Target agent was not provisioned by this actor");
@@ -209,7 +208,6 @@ export function agentProvisioningSecretRoutes(db: Db) {
       }
 
       const secretName = req.body.secretName as string;
-      provisioning.assertSecretNameAllowed(scope, secretName);
       const secret = await secretsSvc.getByName(target.companyId, secretName);
       if (!secret || secret.createdByAgentId !== actorAgentId) {
         throw notFound(`Provisioned secret not found: ${secretName}`);

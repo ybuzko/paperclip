@@ -25,10 +25,7 @@ The scope bounds the blast radius:
 
 | Field | Meaning |
 | --- | --- |
-| `adapterTypes` | Adapter types the provisioner may create agents for (e.g. `["claudeclaw_gateway"]`). Any other adapter type is rejected with 403. |
 | `reportsTo` | Every agent the provisioner creates reports to this agent id, or `null` for no manager. The provisioner cannot choose a different manager per request. |
-| `secretNamePrefix` | Company secrets the provisioner creates, rotates, or binds (via the provisioning-secrets endpoints) must have a name starting with this prefix. |
-| `maxAgents` | Optional cap on how many non-terminated agents this provisioner may have created at once. |
 
 ### Set the grant
 
@@ -39,10 +36,7 @@ curl -X PUT "$PAPERCLIP_URL/api/agents/$PROVISIONER_AGENT_ID/provision-grant" \
   -d '{
     "enabled": true,
     "scope": {
-      "adapterTypes": ["claudeclaw_gateway"],
-      "reportsTo": "'"$COORDINATOR_AGENT_ID"'",
-      "secretNamePrefix": "ansible_",
-      "maxAgents": 20
+      "reportsTo": "'"$COORDINATOR_AGENT_ID"'"
     }
   }'
 ```
@@ -62,10 +56,7 @@ curl "$PAPERCLIP_URL/api/agents/$PROVISIONER_AGENT_ID/provision-grant" \
 {
   "enabled": true,
   "scope": {
-    "adapterTypes": ["claudeclaw_gateway"],
-    "reportsTo": "…",
-    "secretNamePrefix": "ansible_",
-    "maxAgents": 20
+    "reportsTo": "…"
   },
   "grantedByUserId": "…",
   "updatedAt": "2026-09-20T12:00:00.000Z",
@@ -74,7 +65,7 @@ curl "$PAPERCLIP_URL/api/agents/$PROVISIONER_AGENT_ID/provision-grant" \
 ```
 
 `provisionedAgentCount` counts non-terminated agents whose `metadata.provisionedByAgentId` matches this
-agent — i.e. how much of `maxAgents` is used.
+agent.
 
 ### Clear the grant
 
@@ -140,7 +131,7 @@ endpoint single-purpose: it is not a general-purpose agent-creation route with e
   `agents:create`, and no provision grant is ever copied onto it. Provisioning chains stop at one hop
   unless a board user explicitly grants further.
 - `metadata.provisionedByAgentId` is always set to the calling agent's id (merged into any other
-  metadata), which is how the grant's `maxAgents` cap and the idempotency check below work.
+  metadata), which is how the idempotency check below works.
 - `status` starts `"idle"`.
 - `adapterConfig` goes through the same secret-reference normalization the board create-agent route
   uses, so a secret value for a known secret field is handled identically (promoted to a managed
@@ -154,10 +145,8 @@ endpoint single-purpose: it is not a general-purpose agent-creation route with e
 | --- | --- |
 | Caller has no `agents:provision` grant (or the stored scope is malformed) | 403 |
 | Caller is a board actor | 403, points at the normal create-agent route |
-| `adapterType` not in `scope.adapterTypes` | 403 |
 | `adapterType` not a known/registered adapter | 422 |
 | Company has `requireBoardApprovalForNewAgents: true` | 409 |
-| `scope.maxAgents` reached | 409 |
 | An agent with the same `name` exists in the company, provisioned by someone else (or not provisioned at all) | 409 |
 | An agent with the same `name` exists, provisioned by this caller, and already has an API key | 409, body includes `agentId` of the existing agent — no second key is ever minted |
 
@@ -179,7 +168,7 @@ minting a second key; recovering from that state requires a board user issuing a
   written the same way the normal create-agent route writes them: as references, resolved only at
   agent run time.
 - **Provenance.** Every provisioned agent carries `metadata.provisionedByAgentId`, so ownership,
-  `maxAgents` accounting, and the idempotency check are all auditable from the row itself, not from a
+  and the idempotency check are all auditable from the row itself, not from a
   side table.
 - **One key, minted once.** The endpoint never returns more than one live token for a given
   provisioned agent; a retry after a key exists fails closed instead of minting a second one.
@@ -189,3 +178,13 @@ minting a second key; recovering from that state requires a board user issuing a
 - **Activity log.** Grant changes (`agent.provision_grant_set` / `agent.provision_grant_cleared`) and
   successful provisioning (`agent.provisioned`, with `provisionedByAgentId`, `adapterType`,
   `reportsTo`, and the minted key's id — never the token) are all recorded in the company activity log.
+
+## Scope is optional
+
+The grant needs no scope. An agent holding `agents:provision` may provision agents of any known
+adapter type and create secrets under any name. What bounds it is provenance, not configuration:
+it can mint a key only for, and bind secrets only to, agents it provisioned itself; it can rotate
+and bind only secrets it created itself; and it can never read a secret value or list secrets.
+The one optional scope field is `reportsTo`: when set, every provisioned agent reports to that
+agent and the caller cannot choose another manager; when absent the caller may pass `reportsTo`
+in the provision request.
