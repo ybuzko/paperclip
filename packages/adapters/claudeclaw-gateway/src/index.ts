@@ -40,9 +40,11 @@ Runtime mapping:
 - {ok:true, exitCode!=0} -> claudeclaw_gateway_turn_failed (the underlying claude -p run failed).
 - {ok:false} -> claudeclaw_gateway_inject_failed; timeout-shaped errors are marked transient so they retry.
 - HTTP 401/403 -> claudeclaw_gateway_auth_failed (surfaces, no retry). 429/5xx and connection errors are
-  transient. An adapter-side timeout aborts the request and is transient.
+  transient. An adapter-side timeout (timeoutSec > 0) ends the run without a retry family: the daemon is
+  still running the turn and a retry would inject a duplicate wake. timeoutSec 0 (default) waits.
 - claudeclaw reports no token usage on inject, so runs carry no usage numbers.
 
 Connection test:
-- GET {url}/api/health (unauthenticated) and GET {url}/api/state with the bearer token.
+- GET {url}/api/health (unauthenticated), then POST {url}/api/inject with the bearer token and an empty
+  body: HTTP 400 proves the token (the daemon honours settings.apiToken only on /api/inject).
 `;

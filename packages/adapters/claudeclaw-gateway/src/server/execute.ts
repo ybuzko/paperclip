@@ -17,6 +17,7 @@ import {
   DEFAULT_TIMEOUT_SEC,
   LOG_PREFIX,
 } from "../shared/constants.js";
+import { postJson, type JsonHttpResponse } from "./http.js";
 
 type WakePayload = {
   runId: string;
@@ -577,10 +578,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     `${LOG_PREFIX} POST ${injectUrl} (thread=${binding.thread}, project=${binding.projectName ?? binding.projectId}, forward=false, timeout=${timeoutSec > 0 ? `${timeoutSec}s` : "none"}, message=${message.length} chars)\n`,
   );
 
-  let response: Response;
+  // node:http rather than fetch: undici's 300 s header timeout would otherwise cut every long turn
+  // short no matter what timeoutSec says (see http.ts).
+  let response: JsonHttpResponse;
   try {
-    response = await fetch(injectUrl, {
-      method: "POST",
+    response = await postJson(new URL(injectUrl), {
       headers: {
         Authorization: `Bearer ${apiToken}`,
         "Content-Type": "application/json",
@@ -591,11 +593,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
   } catch (err) {
     if (isAbortLike(err)) {
-      await ctx.onLog("stderr", `${LOG_PREFIX} inject timed out after ${timeoutSec}s\n`);
+      await ctx.onLog("stderr", `${LOG_PREFIX} inject timed out after ${timeoutSec}s; not retrying (the daemon is still running the turn)\n`);
+      // Deliberately no errorFamily: a retry would inject a duplicate wake into the same thread
+      // while the daemon is still working on this one.
       return failure({
         errorCode: "claudeclaw_gateway_timeout",
-        errorMessage: `claudeclaw inject timed out after ${timeoutSec}s. The daemon may still be running the turn in thread ${binding.thread}; wakes for the same thread queue behind it.`,
-        errorFamily: "transient_upstream",
+        errorMessage: `claudeclaw inject timed out after ${timeoutSec}s. The daemon is still running the turn in thread ${binding.thread}, so this run is not retried automatically; raise timeoutSec or set it to 0 to wait for the turn.`,
         timedOut: true,
       });
     }
@@ -608,7 +611,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
   }
 
-  const rawText = await response.text();
+  const rawText = response.text;
   let body: unknown = null;
   if (rawText.trim()) {
     try {

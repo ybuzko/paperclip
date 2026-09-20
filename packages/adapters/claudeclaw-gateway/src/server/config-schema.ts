@@ -34,7 +34,7 @@ export function getConfigSchema(): AdapterConfigSchema {
         label: "Timeout seconds",
         type: "number",
         default: DEFAULT_TIMEOUT_SEC,
-        hint: "How long Paperclip waits for the blocking inject call before aborting the run.",
+        hint: "Seconds to wait for the blocking inject call. 0 (default) waits until the daemon finishes the turn. A timed-out run is not retried, because the daemon keeps running the turn and a retry would inject a duplicate wake.",
       },
       {
         key: "paperclipApiUrl",

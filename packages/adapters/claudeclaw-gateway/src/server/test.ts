@@ -116,20 +116,25 @@ export async function testEnvironment(
     };
   }
 
+  // The daemon honours settings.apiToken only on POST /api/inject (every other /api route wants the
+  // web UI token), so probe auth there with an empty body: the daemon validates the token first and
+  // then rejects the missing message with HTTP 400 without touching any session.
   try {
-    const response = await fetch(apiUrl(baseUrl, "/api/state"), {
-      method: "GET",
+    const response = await fetch(apiUrl(baseUrl, "/api/inject"), {
+      method: "POST",
       headers: {
         Authorization: `Bearer ${apiToken}`,
+        "Content-Type": "application/json",
         Accept: "application/json",
       },
+      body: "{}",
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
-    if (response.ok) {
+    if (response.status === 400) {
       checks.push({
-        code: "claudeclaw_gateway_state_ok",
+        code: "claudeclaw_gateway_auth_ok",
         level: "info",
-        message: "Authenticated claudeclaw /api/state call succeeded.",
+        message: "claudeclaw accepted the API token on /api/inject (empty probe rejected as expected).",
       });
     } else if (response.status === 401 || response.status === 403) {
       checks.push({
@@ -140,16 +145,17 @@ export async function testEnvironment(
       });
     } else {
       checks.push({
-        code: "claudeclaw_gateway_state_failed",
+        code: "claudeclaw_gateway_probe_unexpected",
         level: "warn",
-        message: `claudeclaw /api/state returned HTTP ${response.status}.`,
+        message: `claudeclaw answered the empty /api/inject probe with HTTP ${response.status} instead of 400.`,
+        hint: "The daemon may be a different build; verify it runs the patched claudeclaw fork.",
       });
     }
   } catch (err) {
     checks.push({
-      code: "claudeclaw_gateway_state_unreachable",
+      code: "claudeclaw_gateway_probe_unreachable",
       level: "error",
-      message: "Could not reach claudeclaw /api/state.",
+      message: "Could not reach claudeclaw /api/inject for the auth probe.",
       detail: errorDetail(err),
     });
   }

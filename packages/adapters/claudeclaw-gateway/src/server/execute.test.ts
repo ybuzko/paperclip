@@ -71,6 +71,9 @@ async function startStub(behaviour: StubBehaviour = {}): Promise<StubServer> {
       if (req.url === "/api/inject" && req.method === "POST") {
         if (behaviour.inject) return void behaviour.inject(req, raw, res);
         if (!bearerOk(req)) return json(res, 401, { ok: false, error: "unauthorized" });
+        // Like the daemon: token first, then body validation.
+        const message = parsed && typeof parsed === "object" ? (parsed as { message?: unknown }).message : undefined;
+        if (typeof message !== "string" || !message.trim()) return json(res, 400, { ok: false, error: "message is required" });
         return json(res, 200, { ok: true, result: "Turn complete.\n", exitCode: 0, sessionId: "sess-123" });
       }
       json(res, 404, { ok: false, error: "not found" });
@@ -254,7 +257,7 @@ describe("execute", () => {
     expect(result.errorMessage).not.toContain("wrong-token");
   });
 
-  it("marks an adapter-side timeout as transient and timedOut", async () => {
+  it("marks an adapter-side timeout as timedOut with no retry family (the daemon is still running the turn)", async () => {
     const stub = await startStub({
       inject: (_req, _body, res) => {
         setTimeout(() => json(res, 200, { ok: true, result: "late", exitCode: 0, sessionId: "s" }), 1500);
@@ -264,7 +267,20 @@ describe("execute", () => {
     expect(result.exitCode).toBe(1);
     expect(result.timedOut).toBe(true);
     expect(result.errorCode).toBe("claudeclaw_gateway_timeout");
-    expect(result.errorFamily).toBe("transient_upstream");
+    expect(result.errorFamily).toBeNull();
+    expect(result.errorMessage).toContain("not retried");
+  });
+
+  it("waits for a slow turn when timeoutSec is 0 (the default)", async () => {
+    const stub = await startStub({
+      inject: (_req, _body, res) => {
+        setTimeout(() => json(res, 200, { ok: true, result: "late but fine", exitCode: 0, sessionId: "slow-1" }), 1500);
+      },
+    });
+    const result = await execute(makeCtx({ url: stub.url, apiToken: API_TOKEN }));
+    expect(result.exitCode).toBe(0);
+    expect(result.timedOut).toBeFalsy();
+    expect(result.sessionDisplayId).toBe("slow-1");
   });
 
   it("maps {ok:false} daemon errors and treats timeout-shaped ones as transient", async () => {
@@ -375,16 +391,17 @@ describe("testEnvironment", () => {
     return { adapterType: "claudeclaw_gateway", config } as AdapterEnvironmentTestContext;
   }
 
-  it("passes when health and authenticated state both succeed", async () => {
+  it("passes when health succeeds and the empty inject probe is rejected with 400 (token accepted)", async () => {
     const stub = await startStub();
     const result = await testEnvironment(envCtx({ url: stub.url, apiToken: API_TOKEN }));
     expect(result.status).toBe("pass");
     expect(result.checks.map((check) => check.code)).toEqual(
-      expect.arrayContaining(["claudeclaw_gateway_health_ok", "claudeclaw_gateway_state_ok"]),
+      expect.arrayContaining(["claudeclaw_gateway_health_ok", "claudeclaw_gateway_auth_ok"]),
     );
-    expect(stub.requests.map((entry) => entry.path)).toEqual(["/api/health", "/api/state"]);
+    expect(stub.requests.map((entry) => entry.path)).toEqual(["/api/health", "/api/inject"]);
     expect(stub.requests[0]?.authorization).toBeUndefined();
     expect(stub.requests[1]?.authorization).toBe(`Bearer ${API_TOKEN}`);
+    expect(stub.requests[1]?.body).toEqual({});
   });
 
   it("fails on a bad token", async () => {

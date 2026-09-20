@@ -5,7 +5,7 @@
 ## Transport
 
 - `POST {url}/api/inject` with `Authorization: Bearer <apiToken>` and body `{"message": <wake text>, "forward": false, "thread": <session key>}`.
-- The call blocks until the turn finishes. The adapter aborts after `timeoutSec` (default 600) and marks the run as a transient failure so it retries later; the daemon queues wakes for the same thread behind each other, so a late turn simply delays the next wake in that thread.
+- The call blocks until the turn finishes. The request goes over `node:http`, not `fetch`, because undici fails any response whose headers take longer than 300 s (`UND_ERR_HEADERS_TIMEOUT`) regardless of the caller's timeout. With `timeoutSec` at 0 (default) the run stays open until the daemon answers. A configured timeout ends the run as `claudeclaw_gateway_timeout` with **no retry family**: the daemon is still running the turn, and a retry would inject a duplicate wake into the same thread (the daemon queues wakes per thread behind each other).
 - `forward: false` requires the patched claudeclaw fork (see the PIX-4 patch): it suppresses the Telegram echo and adds `sessionId` to the response. A response without a `sessionId` key fails the run with `claudeclaw_gateway_fork_patch_missing` so an unpatched daemon is never used silently.
 
 ## Thread routing
@@ -38,7 +38,7 @@ The message is built exactly like the OpenClaw gateway wake text: a structured P
 | `{ok:false, error}` | `claudeclaw_gateway_inject_failed`; timeout-shaped errors become `claudeclaw_gateway_turn_timeout` with `transient_upstream` |
 | HTTP 401/403 | `claudeclaw_gateway_auth_failed` (no retry family) |
 | HTTP 429 / 5xx, connection errors | `transient_upstream` |
-| Adapter timeout | `claudeclaw_gateway_timeout`, `timedOut: true`, `transient_upstream` |
+| Adapter timeout | `claudeclaw_gateway_timeout`, `timedOut: true`, no retry family (daemon still running the turn) |
 
 claudeclaw returns no token usage on inject, so runs carry no usage numbers.
 
@@ -49,13 +49,13 @@ claudeclaw returns no token usage on inject, so runs carry no usage numbers.
 | `url` | required | `http://` or `https://` base URL of the daemon |
 | `apiToken` | required | claudeclaw `settings.apiToken`; stored as a Paperclip secret reference |
 | `telegramChatId` | none | forum chat id (e.g. `-1001234567890`) used to compose `tg:<chatId>:<topicId>` from a bare `CLAUDECLAW_THREAD`; nothing per project lives here |
-| `timeoutSec` | `600` | blocking inject timeout |
+| `timeoutSec` | `0` | blocking inject timeout in seconds; 0 waits for the turn to finish. A timeout is not retried |
 | `paperclipApiUrl` | `http://10.0.0.34:3100` | Paperclip URL reachable from the daemon host |
 | `claimedApiKeyPath` | `.claude/claudeclaw/paperclip.env` | where the agent keeps its claimed `PAPERCLIP_API_KEY` |
 
 ## Connection test
 
-`GET {url}/api/health` (unauthenticated) followed by `GET {url}/api/state` with the bearer token. A 401 on state is reported as `claudeclaw_gateway_auth_failed`.
+`GET {url}/api/health` (unauthenticated) followed by `POST {url}/api/inject` with the bearer token and an empty `{}` body. The daemon honours `settings.apiToken` only on `/api/inject` (other `/api/*` routes want the web UI token), and it checks the token before the body, so HTTP 400 "message is required" proves auth without touching a session (`claudeclaw_gateway_auth_ok`); 401/403 is `claudeclaw_gateway_auth_failed`.
 
 ## Tests
 
