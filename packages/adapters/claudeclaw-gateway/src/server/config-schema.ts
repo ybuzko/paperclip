@@ -3,6 +3,7 @@ import {
   DEFAULT_CLAIMED_API_KEY_PATH,
   DEFAULT_PAPERCLIP_API_URL,
   DEFAULT_TIMEOUT_SEC,
+  JIRA_ACCOUNT_ID_CONFIG_KEY,
 } from "../shared/constants.js";
 
 export function getConfigSchema(): AdapterConfigSchema {
@@ -49,6 +50,12 @@ export function getConfigSchema(): AdapterConfigSchema {
         type: "text",
         default: DEFAULT_CLAIMED_API_KEY_PATH,
         hint: "Path (relative to the daemon's project directory) of the env file holding the agent's claimed PAPERCLIP_API_KEY.",
+      },
+      {
+        key: JIRA_ACCOUNT_ID_CONFIG_KEY,
+        label: "Supervisor Jira account id",
+        type: "text",
+        hint: "The Jira Cloud accountId this supervisor works as; used only as an assignee filter by the fleet dispatch loop.",
       },
     ],
   };

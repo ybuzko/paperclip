@@ -31,6 +31,8 @@ Optional fields:
 - claimedApiKeyPath (string): where the daemon host keeps its claimed PAPERCLIP_API_KEY, relative to the
   project directory (default ${DEFAULT_CLAIMED_API_KEY_PATH}). The wake message points the agent at this
   file; the key itself never travels in the message.
+- jiraAccountId (string): the Jira Cloud accountId this supervisor works as. Not read by this adapter;
+  used only as an assignee filter by the server-side fleet dispatch loop.
 
 Runtime mapping:
 - POST {url}/api/inject with {"message": <wake text>, "forward": false}. The call blocks until the turn ends.
@@ -43,6 +45,12 @@ Runtime mapping:
   transient. An adapter-side timeout (timeoutSec > 0) ends the run without a retry family: the daemon is
   still running the turn and a retry would inject a duplicate wake. timeoutSec 0 (default) waits.
 - claudeclaw reports no token usage on inject, so runs carry no usage numbers.
+- A wake with wakeReason "fleet_dispatch" gets a "Fleet dispatch" prose block inserted between the
+  Project: context prefix and the structured wake prompt, when fleet dispatch data is present on the
+  execution context (see readFleetDispatch in server/execute.ts). It states the governor's throttle
+  state, 5h/7-day budget usage, ready task and epic counts, and a fixed one-item-per-turn instruction
+  ending in an exact ack line. Never includes the API token or key file contents; omitted when no data
+  is present.
 
 Connection test:
 - GET {url}/api/health (unauthenticated), then POST {url}/api/inject with the bearer token and an empty

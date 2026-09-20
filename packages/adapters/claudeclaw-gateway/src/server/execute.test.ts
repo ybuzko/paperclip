@@ -2,10 +2,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AdapterExecutionContext, AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
 import {
+  buildFleetDispatchBlock,
   buildWakeMessage,
   composeThreadKey,
   execute,
   mapInjectResponse,
+  readFleetDispatch,
   resolveThreadBinding,
 } from "./execute.js";
 import { testEnvironment } from "./test.js";
@@ -161,6 +163,152 @@ describe("buildWakeMessage", () => {
     const message = buildWakeMessage(makeCtx({ url: "http://127.0.0.1:1", apiToken: API_TOKEN }));
     expect(message).toContain("PAPERCLIP_API_URL=http://10.0.0.34:3100");
     expect(message).toContain("<token from .claude/claudeclaw/paperclip.env>");
+  });
+});
+
+describe("buildWakeMessage / fleet_dispatch", () => {
+  const FLEET_DISPATCH = {
+    jiraProject: "FT",
+    readyTasks: 3,
+    epicsToExplode: 1,
+    epicsToClose: 2,
+    epicKeysToClose: ["FT-10", "FT-11"],
+    throttleState: "GREEN",
+    fiveHourPct: 31.4,
+    sevenDayPct: 48.9,
+    sevenDayResetsAt: "2026-09-27T00:00:00.000Z",
+    ackFormat: "FLEET_ACK run-1",
+  };
+
+  it("renders n/a and unknown when window numbers or the reset time are missing", () => {
+    const block = buildFleetDispatchBlock(
+      readFleetDispatch({
+        ...makeCtx({ url: "http://127.0.0.1:1", apiToken: API_TOKEN }),
+        context: { wakeReason: "fleet_dispatch", fleetDispatch: { ...FLEET_DISPATCH, fiveHourPct: null, sevenDayPct: undefined, sevenDayResetsAt: null } },
+      })!,
+    );
+    expect(block).toContain("5h window n/a, 7-day window n/a, resets unknown");
+    expect(block).toContain("3 ready tasks");
+  });
+
+  it("renders the fleet dispatch block with counts and the ack line, after the context prefix and before the structured prompt, and still routes to the right thread", () => {
+    const ctx = makeCtx({ url: "http://127.0.0.1:1", apiToken: API_TOKEN });
+    ctx.context.wakeReason = "fleet_dispatch";
+    ctx.context.fleetDispatch = FLEET_DISPATCH;
+
+    const resolution = resolveThreadBinding(ctx);
+    expect(resolution.ok).toBe(true);
+    if (!resolution.ok) return;
+
+    const message = buildWakeMessage(ctx, resolution.binding);
+    const lines = message.split("\n\n");
+    expect(lines[0]).toBe(`Project: Fleet Tools · thread tg:${CHAT_ID}:42 · workspace /home/galileo/ft · Jira FT`);
+    expect(lines[1]).toContain("Fleet dispatch");
+
+    expect(message).toContain(
+      "Fleet dispatch — the governor allows work (state GREEN, 5h window 31%, 7-day window 49%, resets 2026-09-27).",
+    );
+    expect(message).toContain(
+      "Jira FT currently has assigned to you: 3 ready tasks (To Do / In Progress), 1 epics in To Do to review and break down, 2 epics in In Progress whose children are all complete (FT-10, FT-11).",
+    );
+    expect(message).toContain("Pick ONE item and work it to completion in this turn");
+    expect(message).toContain("End this turn by posting exactly one comment on this dispatch issue that contains the line: FLEET_ACK run-1.");
+    expect(message).not.toContain("Budget is tight");
+    expect(message).not.toContain(API_TOKEN);
+
+    // The structured wake prompt still follows the fleet dispatch block.
+    const fleetIdx = message.indexOf("Fleet dispatch —");
+    const promptIdx = message.indexOf("Paperclip wake event for a claudeclaw gateway agent.");
+    expect(fleetIdx).toBeGreaterThan(-1);
+    expect(promptIdx).toBeGreaterThan(fleetIdx);
+  });
+
+  it("adds the AMBER budget hint when throttleState is AMBER", () => {
+    const ctx = makeCtx({ url: "http://127.0.0.1:1", apiToken: API_TOKEN });
+    ctx.context.wakeReason = "fleet_dispatch";
+    ctx.context.fleetDispatch = { ...FLEET_DISPATCH, throttleState: "AMBER" };
+    const message = buildWakeMessage(ctx);
+    expect(message).toContain("Budget is tight: prefer the smallest ready item.");
+  });
+
+  it("renders no fleet dispatch block when there is no fleetDispatch data", () => {
+    const ctx = makeCtx({ url: "http://127.0.0.1:1", apiToken: API_TOKEN });
+    ctx.context.wakeReason = "fleet_dispatch";
+    const message = buildWakeMessage(ctx);
+    expect(message).not.toContain("Fleet dispatch");
+  });
+
+  it("leaves a non-dispatch wake unchanged even when fleetDispatch is (implausibly) present", () => {
+    const ctx = makeCtx({ url: "http://127.0.0.1:1", apiToken: API_TOKEN });
+    ctx.context.fleetDispatch = FLEET_DISPATCH;
+    const message = buildWakeMessage(ctx);
+    expect(message).not.toContain("Fleet dispatch");
+  });
+});
+
+describe("buildFleetDispatchBlock", () => {
+  it("renders deterministic, decimal-free prose with no keys parenthetical when the close list is empty", () => {
+    const block = buildFleetDispatchBlock({
+      jiraProject: "FT",
+      readyTasks: 0,
+      epicsToExplode: 0,
+      epicsToClose: 0,
+      epicKeysToClose: [],
+      throttleState: "ACCELERATE",
+      fiveHourPct: 0.4,
+      sevenDayPct: 99.6,
+      sevenDayResetsAt: "not-a-date",
+      ackFormat: "ACK",
+    });
+    expect(block).toContain("state ACCELERATE, 5h window 0%, 7-day window 100%, resets not-a-date");
+    expect(block).toContain("0 epics in In Progress whose children are all complete.");
+    expect(block).not.toContain("Budget is tight");
+  });
+});
+
+describe("readFleetDispatch", () => {
+  it("reads a direct fleetDispatch key on the context (the real server path)", () => {
+    const ctx = makeCtx({ url: "http://127.0.0.1:1", apiToken: API_TOKEN });
+    ctx.context.fleetDispatch = {
+      jiraProject: "FT",
+      readyTasks: 1,
+      epicsToExplode: 0,
+      epicsToClose: 0,
+      epicKeysToClose: [],
+      throttleState: "RED",
+      fiveHourPct: 90,
+      sevenDayPct: 95,
+      sevenDayResetsAt: "2026-10-01T00:00:00.000Z",
+      ackFormat: "ACK",
+    };
+    expect(readFleetDispatch(ctx)?.throttleState).toBe("RED");
+  });
+
+  it("falls back to paperclipWake.payload.fleetDispatch", () => {
+    const ctx = makeCtx({ url: "http://127.0.0.1:1", apiToken: API_TOKEN });
+    ctx.context.paperclipWake = {
+      ...(ctx.context.paperclipWake as Record<string, unknown>),
+      payload: { fleetDispatch: { ...({} as Record<string, unknown>), jiraProject: "FT", readyTasks: 1, epicsToExplode: 0, epicsToClose: 0, epicKeysToClose: [], throttleState: "GREEN", fiveHourPct: 1, sevenDayPct: 1, sevenDayResetsAt: "2026-10-01T00:00:00.000Z", ackFormat: "ACK" } },
+    };
+    expect(readFleetDispatch(ctx)?.jiraProject).toBe("FT");
+  });
+
+  it("falls back to paperclipWake.fleetDispatch", () => {
+    const ctx = makeCtx({ url: "http://127.0.0.1:1", apiToken: API_TOKEN });
+    ctx.context.paperclipWake = {
+      ...(ctx.context.paperclipWake as Record<string, unknown>),
+      fleetDispatch: { jiraProject: "FT", readyTasks: 1, epicsToExplode: 0, epicsToClose: 0, epicKeysToClose: [], throttleState: "GREEN", fiveHourPct: 1, sevenDayPct: 1, sevenDayResetsAt: "2026-10-01T00:00:00.000Z", ackFormat: "ACK" },
+    };
+    expect(readFleetDispatch(ctx)?.jiraProject).toBe("FT");
+  });
+
+  it("returns null on missing or malformed data", () => {
+    const ctx = makeCtx({ url: "http://127.0.0.1:1", apiToken: API_TOKEN });
+    expect(readFleetDispatch(ctx)).toBeNull();
+    ctx.context.fleetDispatch = { jiraProject: "FT" };
+    expect(readFleetDispatch(ctx)).toBeNull();
+    ctx.context.fleetDispatch = { ...({} as Record<string, unknown>), jiraProject: "FT", readyTasks: 1, epicsToExplode: 0, epicsToClose: 0, epicKeysToClose: [], throttleState: "PURPLE", fiveHourPct: 1, sevenDayPct: 1, sevenDayResetsAt: "2026-10-01T00:00:00.000Z", ackFormat: "ACK" };
+    expect(readFleetDispatch(ctx)).toBeNull();
   });
 });
 

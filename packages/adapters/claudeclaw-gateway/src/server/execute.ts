@@ -190,6 +190,132 @@ export function resolveThreadBinding(ctx: AdapterExecutionContext): ThreadResolu
   };
 }
 
+export type FleetThrottleState = "GREEN" | "AMBER" | "RED" | "ACCELERATE";
+
+export type FleetDispatch = {
+  jiraProject: string;
+  readyTasks: number;
+  epicsToExplode: number;
+  epicsToClose: number;
+  epicKeysToClose: string[];
+  throttleState: FleetThrottleState;
+  /** null when the governor has no fresh snapshot for the window. */
+  fiveHourPct: number | null;
+  sevenDayPct: number | null;
+  /** ISO timestamp, or null when unknown. */
+  sevenDayResetsAt: string | null;
+  ackFormat: string;
+};
+
+const FLEET_THROTTLE_STATES: ReadonlySet<string> = new Set(["GREEN", "AMBER", "RED", "ACCELERATE"]);
+
+function validateFleetDispatch(value: unknown): FleetDispatch | null {
+  const record = asRecord(value);
+  if (!record) return null;
+
+  const jiraProject = nonEmpty(record.jiraProject);
+  const ackFormat = nonEmpty(record.ackFormat);
+  const sevenDayResetsAt = nonEmpty(record.sevenDayResetsAt);
+  const throttleState = nonEmpty(record.throttleState);
+  if (!jiraProject || !ackFormat || !throttleState) return null;
+  if (!FLEET_THROTTLE_STATES.has(throttleState)) return null;
+
+  const { readyTasks, epicsToExplode, epicsToClose } = record;
+  const isFiniteNumber = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+  if (!isFiniteNumber(readyTasks) || !isFiniteNumber(epicsToExplode) || !isFiniteNumber(epicsToClose)) {
+    return null;
+  }
+  // Window percentages and the reset time are informational; a missing snapshot must not
+  // suppress the whole dispatch block.
+  const fiveHourPct = isFiniteNumber(record.fiveHourPct) ? record.fiveHourPct : null;
+  const sevenDayPct = isFiniteNumber(record.sevenDayPct) ? record.sevenDayPct : null;
+
+  const epicKeysToClose = Array.isArray(record.epicKeysToClose)
+    ? record.epicKeysToClose
+        .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+        .map((entry) => entry.trim())
+        .slice(0, 20)
+    : [];
+
+  return {
+    jiraProject,
+    readyTasks,
+    epicsToExplode,
+    epicsToClose,
+    epicKeysToClose,
+    throttleState: throttleState as FleetThrottleState,
+    fiveHourPct,
+    sevenDayPct,
+    sevenDayResetsAt,
+    ackFormat,
+  };
+}
+
+/**
+ * Read the fleet dispatch payload set by the server-side dispatch loop, checking
+ * every path it could reach the adapter's execution context by, in order:
+ * a direct `fleetDispatch` key on the context (the real path today: the
+ * heartbeat run's contextSnapshot is spread verbatim into the adapter context,
+ * see server/src/services/heartbeat.ts `const adapterContext = { ...context }`
+ * around line 16267), then two speculative nested shapes under `paperclipWake`
+ * in case the dispatch loop instead threads it through the structured wake
+ * payload. Returns a validated object or null; never throws on malformed input.
+ * Exported for tests.
+ */
+export function readFleetDispatch(ctx: AdapterExecutionContext): FleetDispatch | null {
+  const context = ctx.context ?? {};
+
+  const direct = validateFleetDispatch(context.fleetDispatch);
+  if (direct) return direct;
+
+  const paperclipWake = asRecord(context.paperclipWake);
+  if (paperclipWake) {
+    const payload = asRecord(paperclipWake.payload);
+    const viaPayload = payload ? validateFleetDispatch(payload.fleetDispatch) : null;
+    if (viaPayload) return viaPayload;
+
+    const viaWake = validateFleetDispatch(paperclipWake.fleetDispatch);
+    if (viaWake) return viaWake;
+  }
+
+  return null;
+}
+
+function formatFleetPct(value: number | null): string {
+  return value == null ? "n/a" : `${Math.round(value)}%`;
+}
+
+function formatFleetResetDate(iso: string | null): string {
+  if (!iso) return "unknown";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  return date.toISOString().slice(0, 10);
+}
+
+/**
+ * Renders the "Fleet dispatch" prose block prepended to a fleet_dispatch wake.
+ * Deterministic and short: no LLM-authored text, plain counts and a fixed
+ * instruction script. Never includes the API token or any key file contents.
+ * Exported for tests.
+ */
+export function buildFleetDispatchBlock(dispatch: FleetDispatch): string {
+  const readyTasks = Math.round(dispatch.readyTasks);
+  const epicsToExplode = Math.round(dispatch.epicsToExplode);
+  const epicsToClose = Math.round(dispatch.epicsToClose);
+  const closeKeysSuffix = dispatch.epicKeysToClose.length > 0 ? ` (${dispatch.epicKeysToClose.join(", ")})` : "";
+
+  const sentences = [
+    `Fleet dispatch — the governor allows work (state ${dispatch.throttleState}, 5h window ${formatFleetPct(dispatch.fiveHourPct)}, 7-day window ${formatFleetPct(dispatch.sevenDayPct)}, resets ${formatFleetResetDate(dispatch.sevenDayResetsAt)}).`,
+    `Jira ${dispatch.jiraProject} currently has assigned to you: ${readyTasks} ready tasks (To Do / In Progress), ${epicsToExplode} epics in To Do to review and break down, ${epicsToClose} epics in In Progress whose children are all complete${closeKeysSuffix}.`,
+    "Pick ONE item and work it to completion in this turn: a task → work it including your usual evaluation; an epic in To Do → review it, break it into tasks assigned to yourself, then move the epic to In Progress; an epic to close → review the outcome and close it (or reopen work).",
+    "If an item cannot be worked, reassign it to the human with a comment stating the blocker. Do not start a second item.",
+    ...(dispatch.throttleState === "AMBER" ? ["Budget is tight: prefer the smallest ready item."] : []),
+    `End this turn by posting exactly one comment on this dispatch issue that contains the line: ${dispatch.ackFormat}.`,
+  ];
+
+  return sentences.join(" ");
+}
+
 /** First line of the wake: the turn states its own project/thread/workspace context. */
 export function buildContextPrefix(binding: ThreadBinding): string {
   const parts = [
@@ -362,7 +488,15 @@ export function buildWakeMessage(ctx: AdapterExecutionContext, binding?: ThreadB
       : structuredWakePrompt,
     resolveClaimedApiKeyPath(ctx.config.claimedApiKeyPath),
   );
-  return binding ? `${buildContextPrefix(binding)}\n\n${text}` : text;
+
+  const contextPrefix = binding ? buildContextPrefix(binding) : null;
+  const fleetDispatch = wakePayload.wakeReason === "fleet_dispatch" ? readFleetDispatch(ctx) : null;
+  const fleetDispatchBlock = fleetDispatch ? buildFleetDispatchBlock(fleetDispatch) : null;
+
+  const parts = [contextPrefix, fleetDispatchBlock, text].filter(
+    (part): part is string => typeof part === "string" && part.length > 0,
+  );
+  return parts.join("\n\n");
 }
 
 function redactToken(text: string, token: string): string {

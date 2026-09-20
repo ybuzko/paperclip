@@ -26,6 +26,12 @@ The first line states the turn's own context: `Project: <name> · thread <key> �
 
 The message is built exactly like the OpenClaw gateway wake text: a structured Paperclip wake prompt (with the execution contract and the JSON payload) preceded by an env block with `PAPERCLIP_API_URL`, `PAPERCLIP_RUN_ID`, `PAPERCLIP_AGENT_ID`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_TASK_ID`, and `PAPERCLIP_WAKE_REASON`. The Paperclip API key is never in the message; the agent loads it from `claimedApiKeyPath` (default `.claude/claudeclaw/paperclip.env`) in its project directory.
 
+### Fleet dispatch block
+
+When `wakeReason` is `fleet_dispatch`, a "Fleet dispatch" prose paragraph is inserted between the `Project: …` context prefix and the structured wake prompt. It states the governor's throttle state and 5h/7-day budget usage, the counts of ready tasks and epics assigned to the supervisor in the configured Jira project, and a fixed one-item-per-turn instruction script ending in an exact ack line the agent must post as a comment on the dispatch issue. Percentages are rounded to whole numbers; when `throttleState` is `AMBER` an extra sentence asks the agent to prefer the smallest ready item. The block never includes the API token or any key file contents, and it is omitted entirely when no fleet dispatch data is present.
+
+`readFleetDispatch(ctx)` (exported from `./server`) locates that data on the execution context, checking in order: `ctx.context.fleetDispatch` (the real path — the heartbeat run's `contextSnapshot` is spread verbatim into the adapter context, see `server/src/services/heartbeat.ts` around line 16267: `const adapterContext = { ...context }`), then `ctx.context.paperclipWake?.payload?.fleetDispatch`, then `ctx.context.paperclipWake?.fleetDispatch` as speculative fallbacks in case the dispatch loop instead threads the data through the structured wake payload. It returns a validated `FleetDispatch` object or `null`; malformed or missing data never throws and simply renders no block.
+
 ## Result mapping
 
 | Daemon response | Adapter result |
@@ -52,6 +58,7 @@ claudeclaw returns no token usage on inject, so runs carry no usage numbers.
 | `timeoutSec` | `0` | blocking inject timeout in seconds; 0 waits for the turn to finish. A timeout is not retried |
 | `paperclipApiUrl` | `http://10.0.0.34:3100` | Paperclip URL reachable from the daemon host |
 | `claimedApiKeyPath` | `.claude/claudeclaw/paperclip.env` | where the agent keeps its claimed `PAPERCLIP_API_KEY` |
+| `jiraAccountId` | none | the Jira Cloud accountId this supervisor works as; used only as an assignee filter by the fleet dispatch loop, not read by this adapter |
 
 ## Connection test
 

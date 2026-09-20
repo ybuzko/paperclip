@@ -3,11 +3,14 @@ import type { AdapterSessionCodec, AdapterSessionManagement } from "@paperclipai
 export {
   execute,
   buildWakeMessage,
+  buildFleetDispatchBlock,
+  readFleetDispatch,
   mapInjectResponse,
   classifyHttpStatus,
   normalizeBaseUrl,
   resolveClaimedApiKeyPath,
 } from "./execute.js";
+export type { FleetDispatch, FleetThrottleState } from "./execute.js";
 export { testEnvironment } from "./test.js";
 export { getConfigSchema } from "./config-schema.js";
 

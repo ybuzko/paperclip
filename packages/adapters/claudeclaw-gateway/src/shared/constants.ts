@@ -7,3 +7,8 @@ export const DEFAULT_PAPERCLIP_API_URL = "http://10.0.0.34:3100";
 export const DEFAULT_CLAIMED_API_KEY_PATH = ".claude/claudeclaw/paperclip.env";
 
 export const LOG_PREFIX = "[claudeclaw-gateway]";
+
+// Adapter config key holding the Jira Cloud accountId this supervisor works as.
+// Used only as an assignee filter by the fleet dispatch loop; the adapter itself
+// never reads it directly.
+export const JIRA_ACCOUNT_ID_CONFIG_KEY = "jiraAccountId";

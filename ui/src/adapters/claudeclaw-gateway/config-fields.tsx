@@ -108,6 +108,7 @@ export function ClaudeclawGatewayConfigFields({
 
   const url = String(readValue("url", "") ?? "");
   const telegramChatId = String(readValue("telegramChatId", "") ?? "");
+  const jiraAccountId = String(readValue("jiraAccountId", "") ?? "");
   const paperclipApiUrl = String(readValue("paperclipApiUrl", "") ?? "");
   const claimedApiKeyPath = String(readValue("claimedApiKeyPath", "") ?? "");
   const timeoutSec = Number(readValue("timeoutSec", DEFAULT_TIMEOUT_SEC) ?? DEFAULT_TIMEOUT_SEC);
@@ -154,6 +155,19 @@ export function ClaudeclawGatewayConfigFields({
           onCommit={(v) => writeValue("timeoutSec", v)}
           immediate
           className={inputClass}
+        />
+      </Field>
+
+      <Field
+        label="Supervisor Jira account id"
+        hint="The Jira Cloud accountId this supervisor works as; used only as an assignee filter by the fleet dispatch loop."
+      >
+        <DraftInput
+          value={jiraAccountId}
+          onCommit={(v) => writeValue("jiraAccountId", v || undefined)}
+          immediate
+          className={inputClass}
+          placeholder="5f8a1b2c3d4e5f6a7b8c9d0e"
         />
       </Field>
 
