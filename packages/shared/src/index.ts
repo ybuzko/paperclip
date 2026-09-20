@@ -2598,3 +2598,16 @@ export {
   isPaperclipDevRunnerCommand,
   rewriteUrlHostToLoopback,
 } from "./runtime-exposure/loopback-bind.js";
+
+export {
+  agentProvisionGrantScopeSchema,
+  setAgentProvisionGrantSchema,
+  provisionAgentSchema,
+  provisionSecretSchema,
+  bindProvisionedSecretSchema,
+  type AgentProvisionGrantScope,
+  type SetAgentProvisionGrant,
+  type ProvisionAgent,
+  type ProvisionSecret,
+  type BindProvisionedSecret,
+} from "./validators/agent-provisioning.js";
