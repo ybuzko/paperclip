@@ -117,6 +117,12 @@ curl -X POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/agents/provision" \
 `apiKey.token` is returned exactly once, the same as `POST /api/agents/:id/keys` — Paperclip stores
 only its hash. Save it immediately.
 
+The minted key's responsible user is inherited from the provisioning agent's own key (the board
+user who approved that agent's join request). Every agent key must resolve to a responsible user
+or the auth middleware refuses it with `RESPONSIBLE_USER_UNAVAILABLE`; if the provisioning agent's
+key somehow has none, the call fails with 403 rather than minting a key that could never
+authenticate.
+
 ### Caller
 
 Only an agent actor holding the grant for the target company may call this endpoint — a board actor
@@ -177,7 +183,7 @@ minting a second key; recovering from that state requires a board user issuing a
   separately decides to grant it that capability.
 - **Activity log.** Grant changes (`agent.provision_grant_set` / `agent.provision_grant_cleared`) and
   successful provisioning (`agent.provisioned`, with `provisionedByAgentId`, `adapterType`,
-  `reportsTo`, and the minted key's id — never the token) are all recorded in the company activity log.
+  `reportsTo`, the minted key's id and its `responsibleUserId` — never the token) are all recorded in the company activity log.
 
 ## Scope is optional
 

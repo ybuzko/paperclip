@@ -144,6 +144,17 @@ export function agentProvisioningRoutes(db: Db) {
 
       const { actorAgentId, scope } = await provisioning.requireGrantForActor(req.actor, companyId);
 
+      // The minted key inherits the provisioner's responsible user (the board user who
+      // approved the provisioning agent's own key). Every agent key must resolve to a
+      // responsible user or the auth middleware refuses it with RESPONSIBLE_USER_UNAVAILABLE,
+      // so a key minted without one would be dead on arrival.
+      const responsibleUserId = req.actor.onBehalfOfUserId?.trim() || null;
+      if (!responsibleUserId) {
+        throw forbidden("The provisioning agent's key has no responsible user; a provisioned key would be unusable", {
+          code: "RESPONSIBLE_USER_UNAVAILABLE",
+        });
+      }
+
       const body = req.body as ProvisionAgent;
 
       const adapterType = assertKnownAdapterType(body.adapterType);
@@ -175,7 +186,7 @@ export function agentProvisioningRoutes(db: Db) {
         }
 
         const key = await svc.createApiKey(existing.id, body.keyName, { kind: "standard" }, {
-          responsibleUserId: null,
+          responsibleUserId,
         });
         const refreshed = await svc.getById(existing.id);
 
@@ -194,6 +205,7 @@ export function agentProvisioningRoutes(db: Db) {
             adapterType: refreshed?.adapterType ?? existing.adapterType,
             reportsTo: refreshed?.reportsTo ?? existing.reportsTo ?? null,
             keyId: key.id,
+            responsibleUserId,
           },
         });
 
@@ -271,7 +283,7 @@ export function agentProvisioningRoutes(db: Db) {
       await access.setPrincipalPermission(companyId, "agent", created.id, "tasks:assign", true, null);
 
       const key = await svc.createApiKey(created.id, body.keyName, { kind: "standard" }, {
-        responsibleUserId: null,
+        responsibleUserId,
       });
 
       await logActivity(db, {
@@ -289,6 +301,7 @@ export function agentProvisioningRoutes(db: Db) {
           adapterType: created.adapterType,
           reportsTo: created.reportsTo ?? null,
           keyId: key.id,
+          responsibleUserId,
         },
       });
 

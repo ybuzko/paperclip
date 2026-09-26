@@ -76,6 +76,9 @@ describeEmbeddedPostgres("agent provisioning routes", () => {
       companyId,
       source: "agent_key" as const,
       keyId: randomUUID(),
+      // The auth middleware always binds an agent key to its responsible user (the board
+      // user who approved the key); a provisioned key inherits it.
+      onBehalfOfUserId: "board-user",
       ...overrides,
     };
   }
@@ -245,6 +248,8 @@ describeEmbeddedPostgres("agent provisioning routes", () => {
     expect(keyRows).toHaveLength(1);
     expect(keyRows[0]?.keyHash).toBeTruthy();
     expect(keyRows[0]?.keyHash).not.toBe(res.body.apiKey.token);
+    // Inherited from the provisioner's key; a key without one is refused by the auth middleware.
+    expect(keyRows[0]?.responsibleUserId).toBe("board-user");
 
     const membership = await db
       .select()
@@ -259,8 +264,26 @@ describeEmbeddedPostgres("agent provisioning routes", () => {
       provisionedByAgentId: provisionerId,
       adapterType: "process",
       reportsTo: managerId,
+      responsibleUserId: "board-user",
     });
     expect(JSON.stringify(activityRows[0]?.details)).not.toContain(res.body.apiKey.token);
+  });
+
+  it("refuses to mint a key when the provisioner's key has no responsible user, creating nothing", async () => {
+    const companyId = await seedCompany();
+    const provisionerId = await seedAgent(companyId, { name: "Ansible" });
+    await grantProvision(companyId, provisionerId, { reportsTo: null });
+    const app = createApp();
+
+    const res = await withActor(
+      request(app).post(`/api/companies/${companyId}/agents/provision`),
+      agentActor(provisionerId, companyId, { onBehalfOfUserId: undefined }),
+    ).send({ name: "Orphan", adapterType: "process", adapterConfig: {} });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.code ?? res.body.details?.code).toBe("RESPONSIBLE_USER_UNAVAILABLE");
+    const created = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.name, "Orphan")));
+    expect(created).toHaveLength(0);
   });
 
   it("with an unrestricted grant provisions any known adapter type and lets the caller choose reportsTo", async () => {
