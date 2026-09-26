@@ -38,7 +38,67 @@ export type ClaudeclawInjectResponse = {
   exitCode?: unknown;
   sessionId?: unknown;
   error?: unknown;
+  status?: unknown;
+  runId?: unknown;
+  durationMs?: unknown;
+  usage?: unknown;
 };
+
+function finiteOrZero(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+type MappedUsageFields = Pick<
+  AdapterExecutionResult,
+  "usage" | "usageBasis" | "costUsd" | "model" | "billingType" | "biller"
+>;
+
+/**
+ * Per-turn usage reported by a patched daemon in the inject response. Returns null when the
+ * daemon sent no usage (`usage: null`, or an older daemon without the key) so callers leave
+ * every usage field unset.
+ */
+function mapDaemonUsage(raw: unknown): { fields: MappedUsageFields; resultJson: Record<string, unknown> } | null {
+  const usage = asRecord(raw);
+  if (!usage) return null;
+  const inputTokens = finiteOrZero(usage.inputTokens);
+  const outputTokens = finiteOrZero(usage.outputTokens);
+  const cacheReadInputTokens = finiteOrZero(usage.cacheReadInputTokens);
+  const cacheCreationInputTokens = finiteOrZero(usage.cacheCreationInputTokens);
+  const costUsd = finiteOrNull(usage.costUsd);
+  const model = nonEmpty(usage.model);
+  return {
+    fields: {
+      usage: { inputTokens, outputTokens, cachedInputTokens: cacheReadInputTokens + cacheCreationInputTokens },
+      usageBasis: "per_run",
+      ...(costUsd !== null ? { costUsd } : {}),
+      ...(model ? { model } : {}),
+      billingType: "subscription_included",
+      biller: "anthropic",
+    },
+    resultJson: {
+      modelUsage: asRecord(usage.modelUsage),
+      durationMs: finiteOrNull(usage.durationMs),
+      durationApiMs: finiteOrNull(usage.durationApiMs),
+      numTurns: finiteOrNull(usage.numTurns),
+      cacheReadInputTokens,
+      cacheCreationInputTokens,
+    },
+  };
+}
+
+function daemonRunMeta(record: Record<string, unknown>): Record<string, unknown> {
+  const daemonStatus = nonEmpty(record.status);
+  const daemonRunId = nonEmpty(record.runId);
+  return {
+    ...(daemonStatus ? { daemonStatus } : {}),
+    ...(daemonRunId ? { daemonRunId } : {}),
+  };
+}
 
 const TRANSIENT_ERROR_TEXT_RE = /timed?\s*out|timeout|busy|queue|EAGAIN|ECONNRESET|temporarily/i;
 
@@ -620,15 +680,24 @@ export function mapInjectResponse(input: {
   const resultText = typeof record.result === "string" ? record.result : "";
   const exitCode = typeof record.exitCode === "number" && Number.isFinite(record.exitCode) ? record.exitCode : 0;
   const sessionParams = sessionId ? { claudeclawSessionId: sessionId } : null;
+  const mappedUsage = mapDaemonUsage(record.usage);
+  const runMeta = daemonRunMeta(record);
 
   if (exitCode !== 0) {
-    return failure({
+    const failed = failure({
       errorCode: "claudeclaw_gateway_turn_failed",
       errorMessage: `claudeclaw turn exited with code ${exitCode}${resultText.trim() ? `: ${redact(resultText.trim().slice(0, 500))}` : ""}`,
       errorMeta: { status: input.status, exitCode },
       sessionParams,
       sessionDisplayId: sessionId,
     });
+    // A failed turn still consumed tokens; carry them so the run is costed.
+    if (!mappedUsage) return failed;
+    return {
+      ...failed,
+      ...mappedUsage.fields,
+      resultJson: { ok: true, exitCode, sessionId, usage: mappedUsage.resultJson, ...runMeta },
+    };
   }
 
   if (!sessionId) {
@@ -648,11 +717,14 @@ export function mapInjectResponse(input: {
     summary: redact(resultText.trim()) || null,
     sessionParams,
     sessionDisplayId: sessionId,
+    ...(mappedUsage ? mappedUsage.fields : {}),
     resultJson: {
       ok: true,
       exitCode,
       sessionId,
       resultChars: resultText.length,
+      ...(mappedUsage ? { usage: mappedUsage.resultJson } : {}),
+      ...runMeta,
     },
   };
 }
@@ -766,6 +838,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   } else {
     await ctx.onLog("stderr", `${LOG_PREFIX} ${result.errorCode}: ${result.errorMessage ?? ""}\n`);
+  }
+  if (result.usage) {
+    const { inputTokens, outputTokens, cachedInputTokens } = result.usage;
+    await ctx.onLog(
+      "stdout",
+      `${LOG_PREFIX} usage in=${inputTokens} out=${outputTokens} cached=${cachedInputTokens ?? 0} cost=$${result.costUsd ?? "n/a"} model=${result.model ?? "unknown"}\n`,
+    );
+  } else if (result.exitCode === 0) {
+    await ctx.onLog("stdout", `${LOG_PREFIX} no usage in inject response (unpatched daemon)\n`);
   }
   return result;
 }

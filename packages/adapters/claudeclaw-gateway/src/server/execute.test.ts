@@ -525,6 +525,178 @@ describe("mapInjectResponse", () => {
   });
 });
 
+const DAEMON_USAGE = {
+  inputTokens: 9,
+  outputTokens: 34,
+  cacheReadInputTokens: 13689,
+  cacheCreationInputTokens: 8369,
+  costUsd: 0.0182859,
+  durationMs: 1264,
+  durationApiMs: 993,
+  numTurns: 1,
+  model: "claude-haiku-4-5-20251001",
+  modelUsage: {
+    "claude-haiku-4-5-20251001": {
+      inputTokens: 9,
+      outputTokens: 34,
+      cacheReadInputTokens: 13689,
+      cacheCreationInputTokens: 8369,
+      costUsd: 0.0182859,
+    },
+  },
+};
+
+const USAGE_FIELDS = ["usage", "usageBasis", "costUsd", "model", "billingType", "biller"] as const;
+
+describe("inject usage", () => {
+  it("maps a full daemon usage object onto the result and logs it", async () => {
+    const stub = await startStub({
+      inject: (_req, _body, res) =>
+        json(res, 200, {
+          ok: true,
+          sessionId: "sess-u",
+          exitCode: 0,
+          result: "Done.",
+          status: "succeeded",
+          runId: "daemon-run-1",
+          durationMs: 1264,
+          usage: DAEMON_USAGE,
+        }),
+    });
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const result = await execute(
+      makeCtx(
+        { url: stub.url, apiToken: API_TOKEN, timeoutSec: 5 },
+        { onLog: async (stream, chunk) => void logs.push({ stream, chunk }) },
+      ),
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.summary).toBe("Done.");
+    expect(result.usage).toEqual({ inputTokens: 9, outputTokens: 34, cachedInputTokens: 22058 });
+    expect(result.usageBasis).toBe("per_run");
+    expect(result.costUsd).toBe(0.0182859);
+    expect(result.model).toBe("claude-haiku-4-5-20251001");
+    expect(result.billingType).toBe("subscription_included");
+    expect(result.biller).toBe("anthropic");
+    expect(result.provider).toBe("claudeclaw_gateway");
+    expect(result.resultJson).toEqual({
+      ok: true,
+      exitCode: 0,
+      sessionId: "sess-u",
+      resultChars: 5,
+      usage: {
+        modelUsage: DAEMON_USAGE.modelUsage,
+        durationMs: 1264,
+        durationApiMs: 993,
+        numTurns: 1,
+        cacheReadInputTokens: 13689,
+        cacheCreationInputTokens: 8369,
+      },
+      daemonStatus: "succeeded",
+      daemonRunId: "daemon-run-1",
+    });
+    expect(logs).toContainEqual({
+      stream: "stdout",
+      chunk: "[claudeclaw-gateway] usage in=9 out=34 cached=22058 cost=$0.0182859 model=claude-haiku-4-5-20251001\n",
+    });
+  });
+
+  it("leaves every usage field unset when the daemon sends usage:null", () => {
+    const result = mapInjectResponse({
+      status: 200,
+      body: { ok: true, result: "Turn complete.\n", exitCode: 0, sessionId: "sess-123", usage: null },
+      rawText: "",
+      apiToken: API_TOKEN,
+    });
+    for (const key of USAGE_FIELDS) expect(result).not.toHaveProperty(key);
+    expect(result).toEqual({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      provider: "claudeclaw_gateway",
+      summary: "Turn complete.",
+      sessionParams: { claudeclawSessionId: "sess-123" },
+      sessionDisplayId: "sess-123",
+      resultJson: { ok: true, exitCode: 0, sessionId: "sess-123", resultChars: 15 },
+    });
+  });
+
+  it("leaves every usage field unset for an older daemon without the usage key, and logs that", async () => {
+    const stub = await startStub();
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const result = await execute(
+      makeCtx(
+        { url: stub.url, apiToken: API_TOKEN, timeoutSec: 5 },
+        { onLog: async (stream, chunk) => void logs.push({ stream, chunk }) },
+      ),
+    );
+    for (const key of USAGE_FIELDS) expect(result).not.toHaveProperty(key);
+    expect(result.exitCode).toBe(0);
+    expect(result.summary).toBe("Turn complete.");
+    expect(result.resultJson).toEqual({ ok: true, exitCode: 0, sessionId: "sess-123", resultChars: 15 });
+    expect(logs).toContainEqual({
+      stream: "stdout",
+      chunk: "[claudeclaw-gateway] no usage in inject response (unpatched daemon)\n",
+    });
+  });
+
+  it("carries usage and cost on a failed turn (exitCode 2)", () => {
+    const result = mapInjectResponse({
+      status: 200,
+      body: { ok: true, result: "boom", exitCode: 2, sessionId: "sess-9", status: "failed", usage: DAEMON_USAGE },
+      rawText: "",
+      apiToken: API_TOKEN,
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("claudeclaw_gateway_turn_failed");
+    expect(result.sessionParams).toEqual({ claudeclawSessionId: "sess-9" });
+    expect(result.usage).toEqual({ inputTokens: 9, outputTokens: 34, cachedInputTokens: 22058 });
+    expect(result.usageBasis).toBe("per_run");
+    expect(result.costUsd).toBe(0.0182859);
+    expect(result.model).toBe("claude-haiku-4-5-20251001");
+    expect(result.billingType).toBe("subscription_included");
+    expect(result.biller).toBe("anthropic");
+    expect(result.resultJson).toMatchObject({ exitCode: 2, sessionId: "sess-9", daemonStatus: "failed" });
+  });
+
+  it("coerces malformed usage numbers to 0 without throwing", () => {
+    const result = mapInjectResponse({
+      status: 200,
+      body: {
+        ok: true,
+        result: "ok",
+        exitCode: 0,
+        sessionId: "sess-m",
+        usage: {
+          inputTokens: "9",
+          outputTokens: "34",
+          cacheReadInputTokens: "x",
+          cacheCreationInputTokens: Number.NaN,
+          costUsd: "0.01",
+          model: "",
+          numTurns: "1",
+          modelUsage: "nope",
+        },
+      },
+      rawText: "",
+      apiToken: API_TOKEN,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.usage).toEqual({ inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 });
+    expect(result.usageBasis).toBe("per_run");
+    expect(result).not.toHaveProperty("costUsd");
+    expect(result).not.toHaveProperty("model");
+    expect((result.resultJson as Record<string, unknown>).usage).toEqual({
+      modelUsage: null,
+      durationMs: null,
+      durationApiMs: null,
+      numTurns: null,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+    });
+  });
+});
+
 describe("sessionCodec", () => {
   it("round-trips the claudeclaw session id", () => {
     expect(sessionCodec.deserialize({ claudeclawSessionId: "abc" })).toEqual({ claudeclawSessionId: "abc" });
