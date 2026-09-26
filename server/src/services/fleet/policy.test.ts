@@ -379,6 +379,122 @@ describe("decideThrottle: hysteresis (FR-4.1)", () => {
   });
 });
 
+describe("decideThrottle: early window (minElapsedFraction, pace hypersensitivity fix)", () => {
+  it("holds the previous state instead of reacting to an extreme early-window pace", () => {
+    // elapsedFraction 0.02 (< minElapsedFraction 0.10) with usedPct 50 would
+    // be pace 25.0 — wildly over red_pace — if pace tiers applied.
+    const decision = decideThrottle({
+      snapshots: freshSnapshots({ fiveHourPct: 40, usedPct: 50, elapsedFraction: 0.02 }),
+      previousState: "AMBER",
+      params,
+      now: NOW,
+    });
+    expect(decision.state).toBe("AMBER");
+    expect(decision.reason).toMatch(/early window/i);
+    expect(decision.reason).toMatch(/minElapsedFraction/);
+  });
+
+  it("defaults to GREEN in the early window when there is no previous state", () => {
+    const decision = decideThrottle({
+      snapshots: freshSnapshots({ fiveHourPct: 40, usedPct: 50, elapsedFraction: 0.02 }),
+      previousState: null,
+      params,
+      now: NOW,
+    });
+    expect(decision.state).toBe("GREEN");
+    expect(decision.reason).toMatch(/early window/i);
+  });
+
+  it("does not flip state across repeated senses within the early window despite noisy pace", () => {
+    const first = decideThrottle({
+      snapshots: freshSnapshots({ fiveHourPct: 40, usedPct: 5, elapsedFraction: 0.01 }), // pace ~5.0
+      previousState: null,
+      params,
+      now: NOW,
+    });
+    expect(first.state).toBe("GREEN");
+
+    const second = decideThrottle({
+      snapshots: freshSnapshots({ fiveHourPct: 40, usedPct: 1, elapsedFraction: 0.03 }), // pace ~0.33
+      previousState: first.state,
+      params,
+      now: NOW,
+    });
+    expect(second.state).toBe("GREEN");
+    expect(second.reason).toMatch(/early window/i);
+  });
+
+  it("still forces RED from a fresh 5h breach during the early window", () => {
+    const decision = decideThrottle({
+      snapshots: freshSnapshots({ fiveHourPct: params.red5h, usedPct: 5, elapsedFraction: 0.02 }),
+      previousState: null,
+      params,
+      now: NOW,
+    });
+    expect(decision.state).toBe("RED");
+    expect(decision.reason).toMatch(/red_5h/);
+    expect(decision.reason).not.toMatch(/early window/i);
+  });
+
+  it("still applies the staleness rule during the early window", () => {
+    const staleSevenDay = sevenDaySnapshot({
+      usedPct: 50,
+      elapsedFraction: 0.02,
+      observedAt: new Date(NOW.getTime() - params.staleAfterMs - 1),
+    });
+    const decision = decideThrottle({
+      snapshots: [fiveHourSnapshot(40), staleSevenDay],
+      previousState: null,
+      params,
+      now: NOW,
+    });
+    expect(decision.state).toBe("AMBER");
+    expect(decision.stale).toBe(true);
+    expect(decision.reason).toMatch(/stale/i);
+    expect(decision.reason).not.toMatch(/early window/i);
+  });
+
+  it("applies pace tiers normally once elapsedFraction reaches minElapsedFraction", () => {
+    // Exactly at minElapsedFraction (0.10): the "< minElapsedFraction" hold no
+    // longer applies, so pace tiers take over. usedPct 70 at 10% elapsed ->
+    // pace 7.0, well over red_pace.
+    const decision = decideThrottle({
+      snapshots: freshSnapshots({
+        fiveHourPct: 40,
+        usedPct: 70,
+        elapsedFraction: params.minElapsedFraction,
+      }),
+      previousState: null,
+      params,
+      now: NOW,
+    });
+    expect(decision.state).toBe("RED");
+    expect(decision.reason).not.toMatch(/early window/i);
+  });
+
+  it("transitions out of the held early-window state once minElapsedFraction is crossed", () => {
+    const early = decideThrottle({
+      snapshots: freshSnapshots({ fiveHourPct: 40, usedPct: 50, elapsedFraction: 0.05 }),
+      previousState: null,
+      params,
+      now: NOW,
+    });
+    expect(early.state).toBe("GREEN");
+    expect(early.reason).toMatch(/early window/i);
+
+    // Same underlying usedPct trajectory, but now past minElapsedFraction, at
+    // a pace (50 / 15 ~= 3.33) that is clearly over red_pace.
+    const later = decideThrottle({
+      snapshots: freshSnapshots({ fiveHourPct: 40, usedPct: 50, elapsedFraction: 0.15 }),
+      previousState: early.state,
+      params,
+      now: NOW,
+    });
+    expect(later.state).toBe("RED");
+    expect(later.reason).not.toMatch(/early window/i);
+  });
+});
+
 describe("nextSenseDueAt", () => {
   it("returns now + sense_interval when nothing resets soon", () => {
     const snapshots = freshSnapshots({});

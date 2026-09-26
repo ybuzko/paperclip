@@ -14,6 +14,8 @@ export const governorParamsPatchSchema = z
     hysteresisPp: z.number().min(0),
     bucketHoldPct: z.number().min(0).max(100),
     staleAfterMs: z.number().int().positive(),
+    /** Fraction (0..1) of the weekly window before pace tiers apply (pace hypersensitivity fix). */
+    minElapsedFraction: z.number().min(0).max(1),
     senseIntervalMs: z.number().int().positive(),
     defaultModels: z
       .object({

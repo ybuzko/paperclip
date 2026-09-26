@@ -57,6 +57,20 @@ export function computePace(sevenDay: LimitSnapshot, now: Date): number | null {
   return sevenDay.usedPct / (elapsedFraction * 100);
 }
 
+/**
+ * Fraction (0..1) of the weekly window that has elapsed, or null when
+ * `resetsAt` is missing. Unlike {@link computePace}'s internal fraction, this
+ * is NOT floored at 0.01 — callers that need to detect "early window"
+ * conditions (a tiny, noisy denominator) want the true fraction, not the
+ * divide-by-zero guard used for the pace ratio itself.
+ */
+export function weeklyElapsedFraction(sevenDay: LimitSnapshot, now: Date): number | null {
+  if (sevenDay.resetsAt == null) return null;
+  const windowStart = sevenDay.resetsAt.getTime() - SEVEN_DAYS_MS;
+  const rawFraction = (now.getTime() - windowStart) / SEVEN_DAYS_MS;
+  return Math.min(1, Math.max(0, rawFraction));
+}
+
 /** Day (1..7) of the current weekly window, or null when `resetsAt` is missing. */
 export function weeklyDayIndex(sevenDay: LimitSnapshot, now: Date): number | null {
   if (sevenDay.resetsAt == null) return null;
@@ -173,6 +187,7 @@ export function decideThrottle(input: {
   const sevenDayPct = sevenDay?.usedPct ?? null;
   const pace = sevenDay ? computePace(sevenDay, now) : null;
   const weeklyDay = sevenDay ? weeklyDayIndex(sevenDay, now) : null;
+  const elapsedFraction = sevenDay ? weeklyElapsedFraction(sevenDay, now) : null;
 
   // FR-4.6: independent of state, and computed from whatever data is
   // available (even if stale) — the floor is a fail-safe on top of the state
@@ -215,12 +230,24 @@ export function decideThrottle(input: {
     reason = `AMBER (stale): no snapshot younger than ${Math.round(
       params.staleAfterMs / 60000,
     )} min for ${staleWindows.join(" and ")}; applying the AMBER policy per FR-1.3.`;
+  } else if (elapsedFraction != null && elapsedFraction < params.minElapsedFraction) {
+    // Rule 3 (pace hypersensitivity fix): early in the weekly window,
+    // elapsedFraction is a tiny/noisy denominator, so pace = usedPct /
+    // elapsedFraction swings wildly and flips the throttle tier on almost
+    // every sense. Hold at the previous state (GREEN with no history) until
+    // enough of the window has elapsed for pace to mean something. The fresh
+    // 5h red_5h rule (Rule 1) and the staleness rule (Rule 2) above still
+    // apply unconditionally — this only replaces the pace-tier rule below.
+    state = previousState ?? "GREEN";
+    reason = `early window: elapsed ${(elapsedFraction * 100).toFixed(1)}% < minElapsedFraction (${(
+      params.minElapsedFraction * 100
+    ).toFixed(0)}%); holding ${state}${previousState ? "" : " (no previous state)"} instead of applying pace tiers.`;
   } else {
-    // Rule 3: pace-based tier.
+    // Rule 4: pace-based tier.
     const { tier, usedFallback } = paceTier(pace, weeklyDay, params);
     const computedState = tier;
 
-    // Rule 4: hysteresis (FR-4.1) — only step down from a previous, more
+    // Rule 5: hysteresis (FR-4.1) — only step down from a previous, more
     // restrictive state once the metric has cleared its threshold by the
     // hysteresis band; otherwise hold the previous state.
     let held = false;
