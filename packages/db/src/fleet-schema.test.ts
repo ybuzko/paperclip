@@ -24,7 +24,9 @@ describe("fleet governor ledger schema", () => {
     expect(config.name).toBe("fleet_limit_snapshots");
     expect(columnNames(fleetLimitSnapshots)).toEqual([
       "id",
+      "provider",
       "window",
+      "model_scope",
       "used_pct",
       "resets_at",
       "source",
@@ -34,7 +36,8 @@ describe("fleet governor ledger schema", () => {
       "observed_at",
       "created_at",
     ]);
-    expect(indexColumns(fleetLimitSnapshots, "fleet_limit_snapshots_window_observed_idx")).toEqual([
+    expect(indexColumns(fleetLimitSnapshots, "fleet_limit_snapshots_provider_window_observed_idx")).toEqual([
+      "provider",
       "window",
       "observed_at",
     ]);
@@ -45,6 +48,7 @@ describe("fleet governor ledger schema", () => {
     expect(config.name).toBe("fleet_throttle_states");
     expect(columnNames(fleetThrottleStates)).toEqual([
       "id",
+      "provider",
       "ts",
       "mode",
       "state",
@@ -67,6 +71,7 @@ describe("fleet governor ledger schema", () => {
     expect(config.name).toBe("fleet_calibration");
     expect(columnNames(fleetCalibration)).toEqual([
       "id",
+      "provider",
       "window",
       "w_usd",
       "ci_low",

@@ -121,8 +121,73 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
       expect(byWindow.get("seven_day_sonnet")).toMatchObject({ usedPct: 5, ok: true });
       expect(byWindow.get("seven_day_opus")).toMatchObject({ usedPct: 91, ok: true });
       expect(byWindow.get("extra_usage")).toMatchObject({ usedPct: null, ok: true });
-      // The unmapped "Some future window" window is dropped, not written.
+      // An unkeyed window without a known label cannot be stored.
       expect(result.snapshots.some((row) => row.window === "Some future window")).toBe(false);
+    });
+
+    it("stores and groups a dynamic model-scoped Anthropic window", async () => {
+      const fableWindow = {
+        label: "Current week (Fable only)",
+        key: "seven_day_model:fable",
+        usedPercent: 87,
+        resetsAt: "2026-01-04T00:00:00.000Z",
+        valueLabel: null,
+      };
+      const surfaceWindow = {
+        label: "Current week (API surface only)",
+        key: "seven_day_surface:api",
+        usedPercent: 31,
+        resetsAt: "2026-01-03T00:00:00.000Z",
+        valueLabel: null,
+      };
+      const futureWindow = {
+        label: "Future keyed window",
+        key: "provider_future_window",
+        usedPercent: 22,
+        resetsAt: null,
+        valueLabel: null,
+      };
+      const svc = createFleetGovernorService({
+        db,
+        logger: fakeLogger(),
+        fetchQuota: async () => [{
+          ...OK_ANTHROPIC_WINDOWS_BY_KEY,
+          windows: [...OK_ANTHROPIC_WINDOWS_BY_KEY.windows, fableWindow, surfaceWindow, futureWindow],
+        }],
+        now: () => new Date("2026-01-02T00:00:00.000Z"),
+      });
+
+      const result = await svc.senseOnce();
+      const fable = result.snapshots.find((row) => row.window === "seven_day_model:fable");
+      expect(fable).toMatchObject({ provider: "anthropic", modelScope: "fable", usedPct: 87, ok: true });
+      expect(result.snapshots.find((row) => row.window === "seven_day_surface:api"))
+        .toMatchObject({ provider: "anthropic", modelScope: null, usedPct: 31, ok: true });
+
+      const status = await svc.getStatus();
+      expect(status.snapshots).toContainEqual(expect.objectContaining({
+        provider: "anthropic",
+        window: "seven_day_model:fable",
+        modelScope: "fable",
+        usedPct: 87,
+        resetsAt: new Date("2026-01-04T00:00:00.000Z"),
+        resetsAtPacific: "2026-01-03 16:00 PST",
+      }));
+      expect(status.providers.anthropic?.snapshots).toContainEqual(expect.objectContaining({
+        window: "seven_day_model:fable",
+        modelScope: "fable",
+        usedPct: 87,
+        resetsAt: new Date("2026-01-04T00:00:00.000Z"),
+      }));
+      expect(status.providers.anthropic?.snapshots).toContainEqual(expect.objectContaining({
+        window: "seven_day_surface:api",
+        modelScope: null,
+        usedPct: 31,
+      }));
+      expect(status.providers.anthropic?.snapshots).toContainEqual(expect.objectContaining({
+        window: "provider_future_window",
+        modelScope: null,
+        usedPct: 22,
+      }));
     });
 
     it("falls back to mapping by label when key is absent", async () => {
@@ -351,6 +416,59 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
       expect(status.admissionsBlocked).toBe(0);
       expect(status.admissionsWouldBlock).toBe(0);
       expect(status.lastBlock).toBeNull();
+    });
+
+    it("keeps provider snapshots and throttle decisions isolated", async () => {
+      const now = new Date("2026-01-02T00:00:00.000Z");
+      await db.insert(fleetSettings).values({
+        key: GOVERNOR_MODE_SETTINGS_KEY,
+        value: { mode: "enforce" },
+        version: "v1",
+        updatedAt: now,
+        updatedBy: "test-admin",
+      });
+      const fetchQuota = async () => [OK_ANTHROPIC_WINDOWS_BY_KEY];
+      const writer = createFleetGovernorService({ db, logger: fakeLogger(), fetchQuota, now: () => now });
+      await writer.senseOnce();
+      await writer.evaluate();
+
+      // A newer provider row for the same window must not replace Anthropic's
+      // quota snapshot or become the governor's active throttle decision.
+      await db.insert(fleetLimitSnapshots).values({
+        provider: "openai",
+        window: "five_hour",
+        usedPct: 99,
+        resetsAt: null,
+        source: "openai",
+        ok: true,
+        observedAt: new Date(now.getTime() + 1_000),
+      });
+      await db.insert(fleetThrottleStates).values({
+        provider: "openai",
+        ts: new Date(now.getTime() + 2_000),
+        mode: "enforce",
+        state: "RED",
+        reason: "unrelated provider state",
+        paramsVersion: "test",
+      });
+
+      const reader = createFleetGovernorService({ db, logger: fakeLogger(), fetchQuota, now: () => now });
+      const status = await reader.getStatus();
+      expect(status.snapshots).toEqual(expect.arrayContaining([
+        expect.objectContaining({ provider: "anthropic", window: "five_hour", usedPct: 12 }),
+        expect.objectContaining({ provider: "openai", window: "five_hour", usedPct: 99 }),
+      ]));
+      expect(status.providers.anthropic?.snapshots).toEqual(expect.arrayContaining([
+        expect.objectContaining({ window: "five_hour", usedPct: 12 }),
+      ]));
+      expect(status.providers.openai?.snapshots).toEqual(expect.arrayContaining([
+        expect.objectContaining({ window: "five_hour", usedPct: 99 }),
+      ]));
+      expect(status.latestDecision).toMatchObject({ provider: "anthropic" });
+
+      const admission = await reader.getAdmission({ companyId: "unused", agentId: "agent" });
+      expect(admission.state).toBe(status.latestDecision?.state);
+      expect(admission.allowed).toBe(true);
     });
   });
 

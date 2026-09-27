@@ -32,6 +32,8 @@ import {
   type LimitSnapshot,
   type ProjectClass,
   type ThrottleState,
+  isModelScopedWindow,
+  modelScopeForWindow,
 } from "./types.js";
 
 /** Minimal logger shape this module needs — satisfied by the app's pino logger or a test fake. */
@@ -55,19 +57,7 @@ const THROTTLE_STATE_HEARTBEAT_MS = 60 * 60 * 1000;
 type FleetLimitSnapshotRow = typeof fleetLimitSnapshots.$inferSelect;
 type FleetThrottleStateRow = typeof fleetThrottleStates.$inferSelect;
 
-/** Stable machine keys `senseOnce()` writes rows for (mirrors quota.ts's Anthropic windows). */
-const SENSE_WINDOW_KEYS = [
-  "five_hour",
-  "seven_day",
-  "seven_day_sonnet",
-  "seven_day_opus",
-  "extra_usage",
-] as const;
-type SenseWindowKey = (typeof SENSE_WINDOW_KEYS)[number];
-
-function isSenseWindowKey(value: string): value is SenseWindowKey {
-  return (SENSE_WINDOW_KEYS as readonly string[]).includes(value);
-}
+type SenseWindowKey = string;
 
 /** Fallback label -> key map, for providers/paths that don't (yet) set `QuotaWindow.key`. */
 const LABEL_TO_SENSE_WINDOW_KEY: Record<string, SenseWindowKey> = {
@@ -79,11 +69,13 @@ const LABEL_TO_SENSE_WINDOW_KEY: Record<string, SenseWindowKey> = {
 };
 
 function resolveSenseWindowKey(window: QuotaWindow): SenseWindowKey | null {
-  if (window.key && isSenseWindowKey(window.key)) return window.key;
+  // Persist every stable key from the quota source so status can expose new
+  // provider windows without requiring a governor release.
+  if (typeof window.key === "string" && window.key.length > 0) return window.key;
   return LABEL_TO_SENSE_WINDOW_KEY[window.label] ?? null;
 }
 
-/** The subset of sensed windows the pure policy in `./policy.ts` actually consumes. */
+/** Stable windows consumed by the governor policy, plus scoped model windows. */
 const FLEET_POLICY_WINDOWS = new Set<FleetWindow>([
   "five_hour",
   "seven_day",
@@ -92,15 +84,19 @@ const FLEET_POLICY_WINDOWS = new Set<FleetWindow>([
 ]);
 
 function isFleetPolicyWindow(value: string): value is FleetWindow {
-  return FLEET_POLICY_WINDOWS.has(value as FleetWindow);
+  return FLEET_POLICY_WINDOWS.has(value as FleetWindow)
+    || isModelScopedWindow(value)
+    || modelScopeForWindow(value) != null;
 }
 
 function toPolicySnapshots(rows: FleetLimitSnapshotRow[]): LimitSnapshot[] {
   const snapshots: LimitSnapshot[] = [];
   for (const row of rows) {
-    if (!isFleetPolicyWindow(row.window)) continue;
+    if (row.provider !== "anthropic" || !isFleetPolicyWindow(row.window)) continue;
     snapshots.push({
       window: row.window,
+      provider: row.provider,
+      modelScope: row.modelScope,
       usedPct: row.usedPct,
       resetsAt: row.resetsAt,
       observedAt: row.observedAt,
@@ -144,6 +140,8 @@ function extractBucketHolds(row: Pick<FleetThrottleStateRow, "inputs"> | null | 
 function serializeSnapshotsForAudit(snapshots: LimitSnapshot[]): Record<string, unknown>[] {
   return snapshots.map((snapshot) => ({
     window: snapshot.window,
+    provider: snapshot.provider,
+    modelScope: snapshot.modelScope,
     usedPct: snapshot.usedPct,
     resetsAt: snapshot.resetsAt ? snapshot.resetsAt.toISOString() : null,
     observedAt: snapshot.observedAt.toISOString(),
@@ -172,13 +170,32 @@ export interface TickResult {
 }
 
 export interface FleetGovernorStatusSnapshot {
+  provider: string;
   window: string;
+  modelScope: string | null;
   usedPct: number | null;
   resetsAt: Date | null;
+  resetsAtPacific: string | null;
   observedAt: Date;
   source: string;
   ok: boolean;
   stale: boolean;
+}
+
+function formatPacificReset(resetsAt: Date | null): string | null {
+  if (!resetsAt) return null;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Los_Angeles",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    timeZoneName: "short",
+  }).formatToParts(resetsAt);
+  const fields = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${fields.year}-${fields.month}-${fields.day} ${fields.hour}:${fields.minute} ${fields.timeZoneName}`;
 }
 
 /** Last blocked (`allowed: false`) admission verdict, for operator visibility. */
@@ -192,6 +209,7 @@ export interface FleetGovernorStatus {
   mode: GovernorMode;
   params: GovernorParams;
   snapshots: FleetGovernorStatusSnapshot[];
+  providers: Record<string, { snapshots: FleetGovernorStatusSnapshot[] }>;
   latestDecision: FleetThrottleStateRow | null;
   nextDueAt: Date;
   /** Cumulative count of getAdmission() calls that returned allowed:true. */
@@ -274,17 +292,19 @@ export function createFleetGovernorService(deps: FleetGovernorServiceDeps): Flee
       .from(fleetLimitSnapshots)
       .where(and(eq(fleetLimitSnapshots.ok, true), gte(fleetLimitSnapshots.observedAt, cutoff)))
       .orderBy(desc(fleetLimitSnapshots.observedAt));
-    const byWindow = new Map<string, FleetLimitSnapshotRow>();
+    const byProviderWindow = new Map<string, FleetLimitSnapshotRow>();
     for (const row of rows) {
-      if (!byWindow.has(row.window)) byWindow.set(row.window, row);
+      const key = `${row.provider}\u0000${row.window}`;
+      if (!byProviderWindow.has(key)) byProviderWindow.set(key, row);
     }
-    return [...byWindow.values()];
+    return [...byProviderWindow.values()];
   }
 
   async function loadLatestThrottleStateRow(): Promise<FleetThrottleStateRow | null> {
     const rows = await deps.db
       .select()
       .from(fleetThrottleStates)
+      .where(eq(fleetThrottleStates.provider, "anthropic"))
       .orderBy(desc(fleetThrottleStates.ts))
       .limit(1);
     return rows[0] ?? null;
@@ -296,7 +316,9 @@ export function createFleetGovernorService(deps: FleetGovernorServiceDeps): Flee
     const inserted = await deps.db
       .insert(fleetLimitSnapshots)
       .values({
+        provider: "anthropic",
         window: "seven_day",
+        modelScope: null,
         usedPct: null,
         resetsAt: null,
         source: "anthropic",
@@ -331,7 +353,9 @@ export function createFleetGovernorService(deps: FleetGovernorServiceDeps): Flee
       const key = resolveSenseWindowKey(window);
       if (!key) continue;
       values.push({
+        provider: anthropic.provider,
         window: key,
+        modelScope: modelScopeForWindow(key),
         usedPct: window.usedPercent,
         resetsAt: window.resetsAt ? new Date(window.resetsAt) : null,
         source: anthropic.source ?? "anthropic",
@@ -394,6 +418,7 @@ export function createFleetGovernorService(deps: FleetGovernorServiceDeps): Flee
 
     if (persisted) {
       await deps.db.insert(fleetThrottleStates).values({
+        provider: "anthropic",
         ts: asOf,
         mode,
         state: decision.state,
@@ -505,15 +530,23 @@ export function createFleetGovernorService(deps: FleetGovernorServiceDeps): Flee
     ]);
 
     const snapshots: FleetGovernorStatusSnapshot[] = latestRows.map((row) => ({
+      provider: row.provider,
       window: row.window,
+      modelScope: row.modelScope ?? modelScopeForWindow(row.window),
       usedPct: row.usedPct,
       resetsAt: row.resetsAt,
+      resetsAtPacific: formatPacificReset(row.resetsAt),
       observedAt: row.observedAt,
       source: row.source,
       ok: row.ok,
       // Mirrors policy.isStale's rule (FR-1.3), applied per-window for display.
       stale: asOf.getTime() - row.observedAt.getTime() > params.staleAfterMs,
     }));
+    const providers = Object.create(null) as FleetGovernorStatus["providers"];
+    for (const snapshot of snapshots) {
+      const provider = providers[snapshot.provider] ??= { snapshots: [] };
+      provider.snapshots.push(snapshot);
+    }
 
     const latestMap = latestSnapshotByWindow(toPolicySnapshots(latestRows));
     const nextDueAt = nextSenseDueAt(latestMap, asOf, params);
@@ -522,6 +555,7 @@ export function createFleetGovernorService(deps: FleetGovernorServiceDeps): Flee
       mode,
       params,
       snapshots,
+      providers,
       latestDecision,
       nextDueAt,
       admissionsAllowed: admissionCounters.allowed,

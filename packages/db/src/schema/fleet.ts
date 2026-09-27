@@ -22,7 +22,9 @@ export const fleetLimitSnapshots = pgTable(
   "fleet_limit_snapshots",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    provider: text("provider").notNull().default("anthropic"),
     window: text("window").notNull(),
+    modelScope: text("model_scope"),
     usedPct: real("used_pct"),
     resetsAt: timestamp("resets_at", { withTimezone: true }),
     source: text("source").notNull(),
@@ -33,7 +35,8 @@ export const fleetLimitSnapshots = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
-    windowObservedIdx: index("fleet_limit_snapshots_window_observed_idx").on(
+    providerWindowObservedIdx: index("fleet_limit_snapshots_provider_window_observed_idx").on(
+      table.provider,
       table.window,
       table.observedAt.desc(),
     ),
@@ -44,6 +47,7 @@ export const fleetThrottleStates = pgTable(
   "fleet_throttle_states",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    provider: text("provider").notNull().default("anthropic"),
     ts: timestamp("ts", { withTimezone: true }).notNull(),
     mode: text("mode").notNull(),
     state: text("state").notNull(),
@@ -67,6 +71,7 @@ export const fleetCalibration = pgTable(
   "fleet_calibration",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    provider: text("provider").notNull().default("anthropic"),
     window: text("window").notNull(),
     wUsd: real("w_usd").notNull(),
     ciLow: real("ci_low"),

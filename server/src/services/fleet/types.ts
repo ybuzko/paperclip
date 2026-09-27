@@ -9,12 +9,27 @@
  * no I/O, no database access, no imports from other services. See ./README.md.
  */
 
-/** §2 Window: the rolling 5-hour window, the weekly window, and model-specific weekly buckets. */
-export type FleetWindow =
-  | "five_hour"
-  | "seven_day"
-  | "seven_day_sonnet"
-  | "seven_day_opus";
+/** Stable keys for the legacy/core Claude quota windows. */
+export const FIVE_HOUR_WINDOW = "five_hour";
+export const SEVEN_DAY_WINDOW = "seven_day";
+export const SEVEN_DAY_SONNET_WINDOW = "seven_day_sonnet";
+export const SEVEN_DAY_OPUS_WINDOW = "seven_day_opus";
+
+/** Providers may add stable quota-window keys without requiring a release. */
+export type FleetWindow = string;
+
+/** True for dynamic `seven_day_model:<slug>` buckets. */
+export function isModelScopedWindow(key: string): boolean {
+  return key.startsWith("seven_day_model:") && key.length > "seven_day_model:".length;
+}
+
+/** Model slug carried by a model-specific window, including legacy Claude keys. */
+export function modelScopeForWindow(key: string): string | null {
+  if (key === SEVEN_DAY_SONNET_WINDOW) return "sonnet";
+  if (key === SEVEN_DAY_OPUS_WINDOW) return "opus";
+  if (!isModelScopedWindow(key)) return null;
+  return key.slice("seven_day_model:".length);
+}
 
 /**
  * §5 FR-1.1: one recorded utilization sample for a window.
@@ -25,6 +40,8 @@ export type FleetWindow =
  */
 export interface LimitSnapshot {
   window: FleetWindow;
+  provider: string;
+  modelScope: string | null;
   usedPct: number | null;
   resetsAt: Date | null;
   observedAt: Date;
