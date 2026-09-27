@@ -9,26 +9,23 @@
  * no I/O, no database access, no imports from other services. See ./README.md.
  */
 
-/** Stable keys for the legacy/core Claude quota windows. */
 export const FIVE_HOUR_WINDOW = "five_hour";
 export const SEVEN_DAY_WINDOW = "seven_day";
 export const SEVEN_DAY_SONNET_WINDOW = "seven_day_sonnet";
 export const SEVEN_DAY_OPUS_WINDOW = "seven_day_opus";
 
-/** Providers may add stable quota-window keys without requiring a release. */
+/** Provider window key, including dynamic model-scoped weekly keys. */
 export type FleetWindow = string;
 
-/** True for dynamic `seven_day_model:<slug>` buckets. */
 export function isModelScopedWindow(key: string): boolean {
   return key.startsWith("seven_day_model:") && key.length > "seven_day_model:".length;
 }
 
-/** Model slug carried by a model-specific window, including legacy Claude keys. */
+/** Slug for a model bucket; surface-scoped windows are not model exclusions. */
 export function modelScopeForWindow(key: string): string | null {
   if (key === SEVEN_DAY_SONNET_WINDOW) return "sonnet";
   if (key === SEVEN_DAY_OPUS_WINDOW) return "opus";
-  if (!isModelScopedWindow(key)) return null;
-  return key.slice("seven_day_model:".length);
+  return isModelScopedWindow(key) ? key.slice("seven_day_model:".length) : null;
 }
 
 /**
@@ -39,9 +36,9 @@ export function modelScopeForWindow(key: string): string | null {
  * has not been used yet has no `resets_at`).
  */
 export interface LimitSnapshot {
-  window: FleetWindow;
   provider: string;
   modelScope: string | null;
+  window: FleetWindow;
   usedPct: number | null;
   resetsAt: Date | null;
   observedAt: Date;
@@ -49,49 +46,30 @@ export interface LimitSnapshot {
 }
 
 /** §2 Throttle state. */
-export type ThrottleState = "GREEN" | "AMBER" | "RED" | "ACCELERATE";
+export type ThrottleState = "OPEN" | "CAPPED" | "RED" | "STALE";
 
-/**
- * §6 Throttle parameters table. Defaults below use the `[proposed: …]` values
- * from the spec (v0.2, 2026-09-13).
- */
+/** Ordered cap steps relative to the weekly reset instant. */
+export interface CapSchedule {
+  timeZone: string;
+  segments: Array<{ beforeResetHours: number | null; capPct: number }>;
+}
+
+/** Governor thresholds and provider/window cap schedules. */
 export interface GovernorParams {
-  /** Pace at/above which the governor enters AMBER. §6 `amber_pace` [proposed: 1.15]. */
-  amberPace: number;
-  /** Pace at/above which the governor enters RED. §6 `red_pace` [proposed: 1.35]. */
-  redPace: number;
-  /** Pace at/below which the governor may ACCELERATE. §6 `accel_pace` [proposed: 0.80]. */
-  accelPace: number;
-  /** Earliest day (1..7) of the weekly window ACCELERATE may trigger. §6 `accel_earliest_day` [proposed: day 4]. */
-  accelEarliestDay: number;
-  /** 5h used% at/above which non-P0 worker launches are held (FR-4.6). §6 `floor_5h` = 80 (decided). */
+  /** Cap schedules keyed by provider and window. */
+  capSchedules: Record<string, Record<string, CapSchedule>>;
+  /** 5h used% at/above which new worker launches are held for every class. */
   floor5h: number;
-  /** 5h used% at/above which the state is RED regardless of pace. §6 `red_5h` [proposed: 90]. */
+  /** Fresh 5h used% at/above which the state is RED, unless required sensing is STALE. */
   red5h: number;
-  /** Hysteresis band in percentage points, applied to every threshold (FR-4.1). §6 `hysteresis` [proposed: 5 pp]. */
+  /** Percentage-point clearance required to leave CAPPED without a cap increase. */
   hysteresisPp: number;
-  /** Model-bucket used% at/above which that model is excluded for non-P0 runs (FR-4.8). §6 `bucket_hold` [proposed: 90]. */
+  /** Model-bucket used% at/above which that model is excluded from new launches. */
   bucketHoldPct: number;
   /** A window is STALE if no snapshot younger than this exists (FR-1.3). §6 `stale_after` [proposed: 15 min]. */
   staleAfterMs: number;
-  /**
-   * Minimum fraction (0..1) of the weekly window that must have elapsed
-   * before pace tiers (amber_pace/red_pace/accel_pace) are applied. Below
-   * this, pace = usedPct / elapsedFraction is dominated by noise (a tiny
-   * denominator), so the governor holds the previous state (or GREEN with no
-   * history) instead of reacting to it. Default 0.10 (10% of the week, ~16.8h).
-   */
-  minElapsedFraction: number;
   /** Sensing cadence (FR-1.1). §6 `sense_interval` [proposed: 5 min]. */
   senseIntervalMs: number;
-  /** §6 `default_model` (decided): supervisors opus; coders sonnet; evaluators sonnet. */
-  defaultModels: { supervisor: string; coder: string; evaluator: string };
-  /** §6 `amber_model` [proposed: sonnet] — coder model while AMBER (FR-4.3). */
-  amberModel: string;
-  /** §6 `amber_effort` [proposed: medium] — coder effort while AMBER (FR-4.3). */
-  amberEffort: string;
-  /** §6 `amber_concurrency_step` [proposed: 1] — coder concurrency reduction while AMBER (FR-4.3). */
-  amberConcurrencyStep: number;
   /** §6 `max_concurrency` — fleet default (decided: 1 worker run per host). */
   maxConcurrency: number;
   /** Version tag for the parameter set in force, for audit (FR-4.10). */
@@ -99,33 +77,33 @@ export interface GovernorParams {
 }
 
 export const DEFAULT_GOVERNOR_PARAMS: GovernorParams = {
-  amberPace: 1.15,
-  redPace: 1.35,
-  accelPace: 0.8,
-  accelEarliestDay: 4,
+  capSchedules: {
+    anthropic: {
+      seven_day: {
+        timeZone: "America/Los_Angeles",
+        segments: [
+          { beforeResetHours: null, capPct: 70 },
+          { beforeResetHours: 10, capPct: 80 },
+          { beforeResetHours: 5, capPct: 99 },
+        ],
+      },
+    },
+  },
   floor5h: 80,
   red5h: 90,
   hysteresisPp: 5,
   bucketHoldPct: 90,
   staleAfterMs: 15 * 60 * 1000,
-  minElapsedFraction: 0.1,
   senseIntervalMs: 5 * 60 * 1000,
-  defaultModels: { supervisor: "opus", coder: "sonnet", evaluator: "sonnet" },
-  amberModel: "sonnet",
-  amberEffort: "medium",
-  amberConcurrencyStep: 1,
   maxConcurrency: 1,
-  paramsVersion: "v0-proposed",
+  paramsVersion: "v1-cap-schedule",
 };
 
 /** §2 Launch parameters in force for new worker runs. */
 export interface LaunchParameters {
-  coder: { model: string; effort: string | null };
-  evaluator: { model: string; effort: string | null };
-  supervisor: { model: string; effort: string | null };
-  /** FR-4.8: models excluded for non-P0 runs because their weekly bucket is at/above `bucket_hold`. */
+  /** Models excluded because their weekly bucket is at/above `bucket_hold`. */
   excludedModels: string[];
-  /** Concurrency in force for non-P0 dispatch (0 under RED per FR-4.4). */
+  /** Concurrency in force for new worker launches across all classes. */
   maxConcurrency: number;
 }
 
@@ -134,27 +112,32 @@ export interface GovernorDecision {
   state: ThrottleState;
   /** True when the decision was forced by stale sensing data (FR-1.3). */
   stale: boolean;
-  pace: number | null;
+  /** Retained as null for the existing persistence column during migration. */
+  pace: null;
   fiveHourPct: number | null;
   sevenDayPct: number | null;
+  capPct: number | null;
+  nextCapChangeAt: Date | null;
   /** FR-4.6: 5h used% >= floor_5h, independent of throttle state. */
   floorActive: boolean;
   /** FR-4.8: model-specific weekly buckets at/above bucket_hold. */
   bucketHolds: FleetWindow[];
+  /** Slugs for every held model-scoped weekly window. */
+  excludedModels: string[];
   /** One human-readable sentence naming the inputs that drove the decision. */
   reason: string;
   paramsVersion: string;
   launchParameters: LaunchParameters;
   holds: {
-    /** AMBER (FR-4.3): hold new P2+ epic dispatch. */
+    /** Legacy hold field: true whenever new work is blocked. */
     newP2PlusDispatch: boolean;
-    /** RED (FR-4.4): hold all new dispatch except P0. */
+    /** Legacy hold field: true whenever new work is blocked. */
     allNonP0Dispatch: boolean;
-    /** FR-4.6: hold all new non-P0 worker launches (coders and evaluators), driven by floorActive. */
+    /** Hold worker launches when capped, red, stale, or the five-hour floor is active. */
     newNonP0WorkerLaunches: boolean;
     /** RED (FR-4.4/FR-4.7): interrupt running non-P0 runs. */
     interruptRunningNonP0: boolean;
-    /** ACCELERATE (FR-4.5): release P3 sweeper work. */
+    /** The cap policy does not accelerate sweepers. */
     releaseP3Sweepers: boolean;
   };
 }

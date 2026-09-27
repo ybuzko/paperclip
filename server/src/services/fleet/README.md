@@ -6,68 +6,40 @@ FR-4, §6, and §9 NFR-2.
 
 ## Contract
 
-`policy.ts`/`types.ts` must stay **pure**: no I/O, no database access, no
-clock reads (`now` is always passed in), and no imports from other services or
-packages. Every function takes plain data in and returns plain data out, so
-decisions can be replayed and unit-tested offline against recorded snapshots.
-`governor-service.ts` is the I/O layer around that pure core (see below) and
-is exempt from the purity rule — it is the only file in this directory
-allowed to touch the database or the clock directly.
+`policy.ts` and `types.ts` are pure: no I/O, database, clock reads, or
+service imports. The caller passes recorded snapshots and `now`. The decision
+reports the cap, next cap change, state, model exclusions, floor, and holds.
 
-- **Inputs**: `LimitSnapshot[]` (recorded `{window, usedPct, resetsAt,
-  observedAt, source}` samples, see FR-1.1), the previous `ThrottleState`,
-  `GovernorParams` (§6 thresholds, defaults in `DEFAULT_GOVERNOR_PARAMS`), and
-  the current time `now: Date`.
-- **Outputs**: a `GovernorDecision` — throttle state, staleness, pace,
-  utilization, active holds/floors/bucket exclusions, `LaunchParameters` for
-  new worker runs, and a human-readable `reason` for audit (FR-4.10).
+## Parameters (`GovernorParams`)
 
-## Parameters (§6, `GovernorParams`)
-
-All defaults live in `DEFAULT_GOVERNOR_PARAMS` (`types.ts`) and can be
-overridden instance-wide via `PATCH /api/fleet/settings` `{params: {...}}`
-(merged onto the stored overrides, not replaced — see `governor-service.ts`'s
-`mergeGovernorParams`).
-
-| Param | Default | Meaning |
+| Parameter | Default | Meaning |
 | --- | --- | --- |
-| `amberPace` | 1.15 | Pace at/above which the governor enters AMBER. |
-| `redPace` | 1.35 | Pace at/above which the governor enters RED. |
-| `accelPace` | 0.80 | Pace at/below which the governor may ACCELERATE. |
-| `accelEarliestDay` | 4 | Earliest day (1..7) of the weekly window ACCELERATE may trigger. |
-| `floor5h` | 80 | 5h used% at/above which non-P0 worker launches are held (FR-4.6), independent of state. |
-| `red5h` | 90 | 5h used% at/above which the state is RED regardless of pace (FR-4.4). |
-| `hysteresisPp` | 5 | Hysteresis band in percentage points, applied to every step-down threshold (FR-4.1). |
-| `bucketHoldPct` | 90 | Model-bucket used% at/above which that model is excluded for non-P0 runs (FR-4.8). |
-| `staleAfterMs` | 15 min | A window is STALE if no snapshot younger than this exists (FR-1.3). Also used by `getAdmission()` to judge whether the *decision itself* is too old to trust. |
-| `minElapsedFraction` | 0.10 | **Pace hypersensitivity fix.** Minimum fraction (0..1) of the weekly window that must have elapsed before pace tiers (`amberPace`/`redPace`/`accelPace`) apply. Below this, pace = usedPct / elapsedFraction has a tiny, noisy denominator and can swing wildly between senses (observed: hundreds of RED/AMBER/GREEN flips in the first day of a window). While elapsed fraction < `minElapsedFraction`, `decideThrottle` holds the previous state (GREEN if there is none) instead of computing a pace tier, with reason `"early window: elapsed X% < minElapsedFraction (…)"`. The fresh `red_5h` rule and the staleness rule are unaffected — they still apply during the early window. |
-| `senseIntervalMs` | 5 min | Sensing cadence (FR-1.1). |
-| `defaultModels` | `{supervisor: opus, coder: sonnet, evaluator: sonnet}` | Default launch models (decided). |
-| `amberModel` | sonnet | Coder model while AMBER (FR-4.3). |
-| `amberEffort` | medium | Coder effort while AMBER (FR-4.3). |
-| `amberConcurrencyStep` | 1 | Coder concurrency reduction while AMBER (FR-4.3). |
-| `maxConcurrency` | 1 | Fleet default concurrency (decided: 1 worker run per host). |
-| `paramsVersion` | `v0-proposed` | Version tag for the parameter set in force, for audit (FR-4.10). |
+| `capSchedules.anthropic.seven_day` | 70%; 80% inside T−10h; 99% inside T−5h | Weekly utilization cap. Strict boundaries: at exactly T−10h the cap is still 70%; one millisecond later it is 80%. |
+| `floor5h` | 80 | Independently holds non-P0 worker launches. |
+| `red5h` | 90 | Enters RED when a fresh five-hour reading reaches this percentage. |
+| `hysteresisPp` | 5 | CAPPED clears at or below cap minus 5 percentage points; a cap step-up also clears it. |
+| `bucketHoldPct` | 90 | Excludes model slugs whose model-scoped weekly usage reaches this percentage. |
+| `staleAfterMs` | 15 min | Maximum sensing age for required five-hour and weekly windows. |
+| `senseIntervalMs` | 5 min | Normal sensing cadence; a cap step may wake it earlier. |
+| `maxConcurrency` | 1 | Non-P0 worker concurrency when the floor is inactive. |
+| `paramsVersion` | `v1-cap-schedule` | Audit version. |
 
-## Files
+Schedule hours are elapsed time before the reset instant, not fixed wall-clock
+hours. The Pacific timezone formats status text. For a Sunday 06:00 Pacific
+reset in ordinary PDT or PST weeks, steps occur Saturday 20:00 and Sunday
+01:00. During the spring transition they occur Saturday 19:00 PST and Sunday
+00:00 PST; during the fall transition they occur Saturday 21:00 PDT and the
+second Sunday 01:00 PST.
 
-- `types.ts` — shared types (`GovernorParams`, `GovernorDecision`,
-  `FleetAdmission`, `ProjectClass`, …) and `DEFAULT_GOVERNOR_PARAMS`.
-- `policy.ts` — `latestSnapshotByWindow`, `isStale`, `computePace`,
-  `weeklyElapsedFraction`, `weeklyDayIndex`, `decideThrottle`, `nextSenseDueAt`.
-- `policy.test.ts` — table-driven Vitest coverage of pace math, every state
-  transition, hysteresis, staleness, the early-window hold, the interactive
-  floor, model-bucket holds, and resense timing around a window reset.
-- `governor-service.ts` — the I/O layer: `createFleetGovernorService` /
-  `getSharedFleetGovernorService` (`senseOnce`, `evaluate`, `tick`, `start`,
-  `getStatus`, `getAdmission`), settings read/write helpers
-  (`fleet_settings` keys `governor_params`/`governor_mode`), and snapshot/
-  throttle-state history queries. Backed by `fleet_limit_snapshots` and
-  `fleet_throttle_states`.
-- `governor-service.test.ts` — embedded-Postgres coverage of sensing,
-  evaluation/persistence, settings overrides, `getStatus`, and
-  `getAdmission` (shadow vs enforce, RED, floor, stale, AMBER-by-class,
-  GREEN).
+The pure policy emits OPEN, CAPPED, RED, or STALE. STALE takes precedence over
+RED; RED takes precedence over CAPPED. `previousCapPct` allows the caller to
+release CAPPED when the scheduled cap steps up. `pace` remains null solely for
+the existing persistence column. Launch parameters contain only model
+exclusions and maximum concurrency.
+
+The existing `governor-service.ts` and API admission layer are separate I/O
+consumers. Their persistence and runtime wiring must be migrated to this
+policy contract before enabling the new behavior in a service deployment.
 
 ## Run admission (`getAdmission`)
 
