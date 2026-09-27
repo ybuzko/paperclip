@@ -8,11 +8,12 @@ const DURATIONS = new Map([[300, "five_hour"], [10080, "seven_day"]]);
 /** Convert documented app-server rate-limit buckets to governor snapshot rows. */
 export function snapshotFromRateLimits(result, observedAt = new Date().toISOString()) {
   const buckets = result?.rateLimitsByLimitId;
-  const byId = buckets && typeof buckets === "object" && !Array.isArray(buckets) ? { ...buckets } : {};
+  const byId = Object.assign(Object.create(null),
+    buckets && typeof buckets === "object" && !Array.isArray(buckets) ? buckets : {});
   const single = result?.rateLimits;
   if (single && typeof single === "object" && !Array.isArray(single)) {
     const id = typeof single.limitId === "string" && single.limitId ? single.limitId : "codex";
-    if (!(id in byId)) byId[id] = single;
+    if (!Object.hasOwn(byId, id)) byId[id] = single;
   }
   const rows = [];
   for (const [limitId, bucket] of Object.entries(byId)) {
@@ -73,6 +74,15 @@ export async function readCodexRateLimits({ command = "codex", timeoutMs = 12000
     pending.set(id, { resolve, reject, method });
     proc.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
   });
+  const waitForClose = async (ms) => {
+    if (proc.exitCode !== null || proc.signalCode !== null) return;
+    let timer;
+    await Promise.race([
+      new Promise((resolve) => proc.once("close", resolve)),
+      new Promise((resolve) => { timer = setTimeout(resolve, ms); }),
+    ]);
+    clearTimeout(timer);
+  };
   try {
     await request("initialize", { clientInfo: { name: "codex-usage-meters", version: "1.0.0" } });
     proc.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
@@ -80,7 +90,14 @@ export async function readCodexRateLimits({ command = "codex", timeoutMs = 12000
   } finally {
     clearTimeout(timer);
     lines.close();
-    proc.kill("SIGTERM");
+    if (proc.pid !== undefined && proc.exitCode === null && proc.signalCode === null) {
+      proc.kill("SIGTERM");
+      await waitForClose(250);
+      if (proc.exitCode === null && proc.signalCode === null) {
+        proc.kill("SIGKILL");
+        await waitForClose(250);
+      }
+    }
   }
 }
 
