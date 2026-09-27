@@ -28,7 +28,7 @@ describe("fleet token weights", () => {
   it("uses the longest matching model prefix and then the provider wildcard", () => {
     const table = loadWeightTable({
       anthropic: {
-        "exp-": { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 },
+        "exp": { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 },
         "experiment-": { input: 2, output: 2, cacheRead: 2, cacheWrite: 2 },
         "": { input: 3, output: 3, cacheRead: 3, cacheWrite: 3 },
       },
