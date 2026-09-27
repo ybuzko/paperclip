@@ -37,9 +37,10 @@ release CAPPED when the scheduled cap steps up. `pace` remains null solely for
 the existing persistence column. Launch parameters contain only model
 exclusions and maximum concurrency.
 
-The existing `governor-service.ts` and API admission layer are separate I/O
-consumers. Their persistence and runtime wiring must be migrated to this
-policy contract before enabling the new behavior in a service deployment.
+`governor-service.ts` persists the selected cap in the decision inputs so
+hysteresis can recognize a scheduled step-up on the next evaluation. The API
+settings validator accepts cap schedules and merges overrides by provider and
+window. Broader dispatch coordination is a separate integration.
 
 ## Run admission (`getAdmission`)
 
@@ -68,9 +69,9 @@ unparseable value, or no `projectId` at all → defaults to `P2`.
 
 1. **Stale** — no trustworthy decision (see above).
 2. **RED** — the throttle state is RED (blocks every project class, including P0).
-3. **Floor** — the latest `five_hour` snapshot used% is at/above `params.floor5h` (FR-4.6), independent of state (so it can block even a GREEN decision).
-4. **AMBER + P2** — AMBER blocks P2 projects only; P0 and P1 are admitted.
-5. Otherwise (GREEN, ACCELERATE, or AMBER for P0/P1) → admitted.
+3. **Floor** — the latest `five_hour` snapshot used% is at/above `params.floor5h` (FR-4.6), independent of state (so it can block even an OPEN decision).
+4. **CAPPED** — blocks every project class.
+5. Otherwise (OPEN) → admitted.
 
 **Shadow vs enforce** (`governor_mode` setting, `fleet_settings` key
 `governor_mode`, `{"mode": "shadow"|"enforce"}`, default `shadow`):

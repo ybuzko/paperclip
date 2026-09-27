@@ -108,13 +108,21 @@ function toPolicySnapshots(rows: FleetLimitSnapshotRow[]): LimitSnapshot[] {
 
 function mergeGovernorParams(overrides: Partial<GovernorParams> | null | undefined): GovernorParams {
   if (!overrides || typeof overrides !== "object") return DEFAULT_GOVERNOR_PARAMS;
+  const capSchedules = { ...DEFAULT_GOVERNOR_PARAMS.capSchedules };
+  for (const [provider, schedules] of Object.entries(overrides.capSchedules ?? {})) {
+    capSchedules[provider] = { ...(capSchedules[provider] ?? {}), ...schedules };
+  }
   return {
     ...DEFAULT_GOVERNOR_PARAMS,
-    ...overrides,
-    defaultModels: {
-      ...DEFAULT_GOVERNOR_PARAMS.defaultModels,
-      ...(overrides.defaultModels ?? {}),
-    },
+    capSchedules,
+    floor5h: overrides.floor5h ?? DEFAULT_GOVERNOR_PARAMS.floor5h,
+    red5h: overrides.red5h ?? DEFAULT_GOVERNOR_PARAMS.red5h,
+    hysteresisPp: overrides.hysteresisPp ?? DEFAULT_GOVERNOR_PARAMS.hysteresisPp,
+    bucketHoldPct: overrides.bucketHoldPct ?? DEFAULT_GOVERNOR_PARAMS.bucketHoldPct,
+    staleAfterMs: overrides.staleAfterMs ?? DEFAULT_GOVERNOR_PARAMS.staleAfterMs,
+    senseIntervalMs: overrides.senseIntervalMs ?? DEFAULT_GOVERNOR_PARAMS.senseIntervalMs,
+    maxConcurrency: overrides.maxConcurrency ?? DEFAULT_GOVERNOR_PARAMS.maxConcurrency,
+    paramsVersion: overrides.paramsVersion ?? DEFAULT_GOVERNOR_PARAMS.paramsVersion,
   };
 }
 
@@ -390,7 +398,9 @@ export function createFleetGovernorService(deps: FleetGovernorServiceDeps): Flee
 
     const policySnapshots = toPolicySnapshots(latestRows);
     const previousState: ThrottleState | null = (previousRow?.state as ThrottleState | undefined) ?? null;
-    const decision = decideThrottle({ snapshots: policySnapshots, previousState, params, now: asOf });
+    const priorInputs = previousRow?.inputs as { capPct?: unknown } | null | undefined;
+    const previousCapPct = typeof priorInputs?.capPct === "number" ? priorInputs.capPct : null;
+    const decision = decideThrottle({ snapshots: policySnapshots, previousState, previousCapPct, params, now: asOf });
 
     // Refresh the in-memory admission cache on every evaluate(), whether or
     // not the decision changed enough to persist — getAdmission() needs the
@@ -433,6 +443,7 @@ export function createFleetGovernorService(deps: FleetGovernorServiceDeps): Flee
           snapshots: serializeSnapshotsForAudit(policySnapshots),
           params,
           bucketHolds: decision.bucketHolds,
+          capPct: decision.capPct,
         },
         launchParameters: decision.launchParameters as unknown as Record<string, unknown>,
       });
@@ -631,18 +642,21 @@ export function createFleetGovernorService(deps: FleetGovernorServiceDeps): Flee
               params.staleAfterMs / 60000,
             )} min); holding new work until sensing resumes.`
           : `stale: no governor decision recorded yet; holding new work until sensing resumes.`;
+    } else if (state === "STALE") {
+      blocked = true;
+      ruleReason = `STALE: ${decisionReason}`;
     } else if (state === "RED") {
       blocked = true;
       ruleReason = `RED: ${decisionReason}`;
     } else if (floorActive) {
       blocked = true;
       ruleReason = `floor: 5h utilization ${fiveHourPct}% >= floor_5h (${params.floor5h}%).`;
-    } else if (state === "AMBER" && projectClass === "P2") {
+    } else if (state === "CAPPED") {
       blocked = true;
-      ruleReason = `AMBER blocks P2 work: ${decisionReason}`;
+      ruleReason = `CAPPED blocks new work: ${decisionReason}`;
     } else {
       blocked = false;
-      ruleReason = `${state ?? "GREEN"}: admitted (project class ${projectClass}).`;
+      ruleReason = `${state ?? "OPEN"}: admitted (project class ${projectClass}).`;
     }
 
     const allowed = mode === "shadow" ? true : !blocked;

@@ -72,15 +72,19 @@ export function fleetRoutes(db: Db) {
       // partial PATCH doesn't clobber previously-set overrides for other
       // fields; DEFAULT_GOVERNOR_PARAMS is applied later, at evaluate() time.
       const existing = await getRawFleetSettingValue(db, GOVERNOR_PARAMS_SETTINGS_KEY);
-      const existingDefaultModels =
-        existing && typeof existing.defaultModels === "object" && existing.defaultModels !== null
-          ? (existing.defaultModels as Record<string, unknown>)
+      const existingCapSchedules =
+        existing && typeof existing.capSchedules === "object" && existing.capSchedules !== null
+          ? (existing.capSchedules as Record<string, Record<string, unknown>>)
           : {};
+      const capSchedules = { ...existingCapSchedules };
+      for (const [provider, schedules] of Object.entries(body.params.capSchedules ?? {})) {
+        capSchedules[provider] = { ...(capSchedules[provider] ?? {}), ...schedules };
+      }
       const merged: Record<string, unknown> = {
         ...existing,
         ...body.params,
-        ...(body.params.defaultModels !== undefined
-          ? { defaultModels: { ...existingDefaultModels, ...body.params.defaultModels } }
+        ...(body.params.capSchedules !== undefined
+          ? { capSchedules }
           : {}),
       };
       await upsertFleetSetting(db, GOVERNOR_PARAMS_SETTINGS_KEY, merged, actor.actorId);
