@@ -10,6 +10,8 @@ export interface QuotaWindow {
   valueLabel: string | null;
   /** optional supporting text, e.g. reset details or provider-specific notes */
   detail?: string | null;
+  /** original provider entry, when a window is derived from a scoped limit */
+  raw?: Record<string, unknown>;
   /**
    * Stable machine key for this window, e.g. "five_hour", "seven_day",
    * "seven_day_sonnet", "seven_day_opus", "extra_usage". Unlike `label`
