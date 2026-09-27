@@ -13,6 +13,7 @@ import {
   type LaunchParameters,
   type LimitSnapshot,
   type ThrottleState,
+  modelScopeForWindow,
 } from "./types.js";
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
@@ -143,10 +144,10 @@ function buildLaunchParameters(
   const isAmber = state === "AMBER";
   const isRed = state === "RED";
 
-  const excludedModels: string[] = [];
+  const excludedModels = new Set<string>();
   for (const window of bucketHolds) {
-    if (window === "seven_day_sonnet") excludedModels.push("sonnet");
-    if (window === "seven_day_opus") excludedModels.push("opus");
+    const modelScope = modelScopeForWindow(window);
+    if (modelScope) excludedModels.add(modelScope);
   }
 
   const coder = isAmber
@@ -164,7 +165,7 @@ function buildLaunchParameters(
     maxConcurrency = Math.max(1, params.maxConcurrency - params.amberConcurrencyStep);
   }
 
-  return { coder, evaluator, supervisor, excludedModels, maxConcurrency };
+  return { coder, evaluator, supervisor, excludedModels: [...excludedModels], maxConcurrency };
 }
 
 export function decideThrottle(input: {
@@ -197,7 +198,8 @@ export function decideThrottle(input: {
   // FR-4.8: model-specific weekly buckets. Not subject to the five_hour/
   // seven_day staleness rule (FR-1.3 names only those two windows).
   const bucketHolds: FleetWindow[] = [];
-  for (const window of ["seven_day_sonnet", "seven_day_opus"] as const) {
+  for (const window of [...latest.keys()].sort()) {
+    if (modelScopeForWindow(window) == null) continue;
     const bucket = latest.get(window);
     if (bucket?.usedPct != null && bucket.usedPct >= params.bucketHoldPct) {
       bucketHolds.push(window);

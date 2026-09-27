@@ -29,6 +29,8 @@ function sevenDaySnapshot(opts: {
         : new Date(NOW.getTime() + (1 - opts.elapsedFraction) * SEVEN_DAYS_MS);
   return {
     window: "seven_day",
+    provider: "anthropic",
+    modelScope: null,
     usedPct: opts.usedPct,
     resetsAt,
     observedAt: opts.observedAt ?? NOW,
@@ -39,6 +41,8 @@ function sevenDaySnapshot(opts: {
 function fiveHourSnapshot(usedPct: number | null, observedAt: Date = NOW): LimitSnapshot {
   return {
     window: "five_hour",
+    provider: "anthropic",
+    modelScope: null,
     usedPct,
     resetsAt: new Date(NOW.getTime() + 2 * 60 * 60 * 1000),
     observedAt,
@@ -53,6 +57,8 @@ function bucketSnapshot(
 ): LimitSnapshot {
   return {
     window,
+    provider: "anthropic",
+    modelScope: window === "seven_day_sonnet" ? "sonnet" : "opus",
     usedPct,
     resetsAt: new Date(NOW.getTime() + 3 * ONE_DAY_MS),
     observedAt,
@@ -303,6 +309,28 @@ describe("decideThrottle: state transitions (no previous state)", () => {
     });
     expect(decision.bucketHolds).toEqual(["seven_day_sonnet"]);
     expect(decision.launchParameters.excludedModels).toEqual(["sonnet"]);
+  });
+
+  it("excludes every dynamic model-scoped window by its model slug", () => {
+    const decision = decideThrottle({
+      snapshots: freshSnapshots({
+        extra: [{
+          window: "seven_day_model:fable",
+          provider: "anthropic",
+          modelScope: "fable",
+          usedPct: 92,
+          resetsAt: new Date(NOW.getTime() + 3 * ONE_DAY_MS),
+          observedAt: NOW,
+          source: "oauth_usage",
+        }],
+      }),
+      previousState: null,
+      params,
+      now: NOW,
+    });
+
+    expect(decision.bucketHolds).toEqual(["seven_day_model:fable"]);
+    expect(decision.launchParameters.excludedModels).toEqual(["fable"]);
   });
 
   it("sets amber_model/amber_effort and reduced concurrency for the coder under AMBER, evaluator unchanged", () => {

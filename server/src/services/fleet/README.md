@@ -140,3 +140,19 @@ Callers (the actual sensing loop, the state publisher) that need lower-level
 policy access can still call into `policy.ts` directly with data they've
 already collected; `governor-service.ts` is the recommended entry point for
 anything backed by the database.
+
+## Provider quota windows
+
+`FleetWindow` is an open string so the quota source can add windows without a
+governor type release. Sensing persists every quota window with a non-empty
+key. Anthropic rows include `provider: "anthropic"`; `modelScope` is the slug
+for `seven_day_model:<slug>` windows (and the legacy Sonnet/Opus windows), and
+is `null` for general and surface windows. The policy applies model bucket
+holds to both legacy and dynamic model-scoped windows. `bucketHolds` continues
+to contain window keys; `launchParameters.excludedModels` contains model
+slugs.
+
+`GET /api/fleet/status` groups each provider's latest successful windows under
+`providers[provider].snapshots`. The top-level `snapshots` array remains
+available during the transition and carries the same rows, including explicit
+`modelScope: null` where a window is not model-scoped.
