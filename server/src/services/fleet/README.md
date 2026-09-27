@@ -31,6 +31,10 @@ reset in ordinary PDT or PST weeks, steps occur Saturday 20:00 and Sunday
 00:00 PST; during the fall transition they occur Saturday 21:00 PDT and the
 second Sunday 01:00 PST.
 
+PATCH accepts only runtime-supported IANA time zones and schedules with a
+single null base segment first, followed by positive hour offsets in strictly
+descending order. Caps must be finite percentages from 0 to 100.
+
 The pure policy emits OPEN, CAPPED, RED, or STALE. STALE takes precedence over
 RED; RED takes precedence over CAPPED. `previousCapPct` allows the caller to
 release CAPPED when the scheduled cap steps up. `pace` remains null solely for

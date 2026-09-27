@@ -4,6 +4,7 @@ import { patchFleetSettingsSchema, type PatchFleetSettings } from "@paperclipai/
 import { validate } from "../middleware/validate.js";
 import { logger } from "../middleware/logger.js";
 import { assertInstanceAdmin, getActorInfo } from "./authz.js";
+import { mergeFleetParamsPatch } from "./fleet-settings-merge.js";
 import {
   getSharedFleetGovernorService,
   getRawFleetSettingValue,
@@ -72,21 +73,7 @@ export function fleetRoutes(db: Db) {
       // partial PATCH doesn't clobber previously-set overrides for other
       // fields; DEFAULT_GOVERNOR_PARAMS is applied later, at evaluate() time.
       const existing = await getRawFleetSettingValue(db, GOVERNOR_PARAMS_SETTINGS_KEY);
-      const existingCapSchedules =
-        existing && typeof existing.capSchedules === "object" && existing.capSchedules !== null
-          ? (existing.capSchedules as Record<string, Record<string, unknown>>)
-          : {};
-      const capSchedules = { ...existingCapSchedules };
-      for (const [provider, schedules] of Object.entries(body.params.capSchedules ?? {})) {
-        capSchedules[provider] = { ...(capSchedules[provider] ?? {}), ...schedules };
-      }
-      const merged: Record<string, unknown> = {
-        ...existing,
-        ...body.params,
-        ...(body.params.capSchedules !== undefined
-          ? { capSchedules }
-          : {}),
-      };
+      const merged = mergeFleetParamsPatch(existing, body.params);
       await upsertFleetSetting(db, GOVERNOR_PARAMS_SETTINGS_KEY, merged, actor.actorId);
     }
 

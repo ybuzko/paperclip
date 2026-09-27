@@ -1,17 +1,38 @@
 import { z } from "zod";
 
+const capScheduleSchema = z.object({
+  timeZone: z.string().min(1).refine((timeZone) => {
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone });
+      return true;
+    } catch {
+      return false;
+    }
+  }, "Invalid IANA time zone"),
+  segments: z.array(z.object({
+    beforeResetHours: z.number().finite().positive().nullable(),
+    capPct: z.number().finite().min(0).max(100),
+  })).min(1).superRefine((segments, context) => {
+    if (segments[0]?.beforeResetHours !== null) {
+      context.addIssue({ code: "custom", message: "The first segment must be the null base", path: [0, "beforeResetHours"] });
+    }
+    let previousHours = Infinity;
+    for (let i = 1; i < segments.length; i++) {
+      const hours = segments[i]!.beforeResetHours;
+      if (hours === null || hours >= previousHours) {
+        context.addIssue({ code: "custom", message: "Step offsets must be strictly descending after the base", path: [i, "beforeResetHours"] });
+      }
+      if (hours !== null) previousHours = hours;
+    }
+  }),
+}).strict();
+
 // Mirrors server/src/services/fleet/types.ts's GovernorParams shape (partial,
 // for PATCH). Kept independent of that module (which must stay pure/import-free
 // per its README) rather than imported from it.
 export const governorParamsPatchSchema = z
   .object({
-    capSchedules: z.record(z.string(), z.record(z.string(), z.object({
-      timeZone: z.string().min(1),
-      segments: z.array(z.object({
-        beforeResetHours: z.number().positive().nullable(),
-        capPct: z.number().min(0).max(100),
-      })).min(1),
-    }).strict())),
+    capSchedules: z.record(z.string(), z.record(z.string(), capScheduleSchema)),
     floor5h: z.number().min(0).max(100),
     red5h: z.number().min(0).max(100),
     hysteresisPp: z.number().min(0),
