@@ -31,6 +31,7 @@ const KNOWN_DEFAULTS: Record<string, AdapterCapabilities> = {
   opencode_local: { supportsInstructionsBundle: true, supportsSkills: true, supportsLocalAgentJwt: true, requiresMaterializedRuntimeSkills: true, supportsModelProfiles: true, supportsAcp: false },
   pi_local: { supportsInstructionsBundle: true, supportsSkills: true, supportsLocalAgentJwt: true, requiresMaterializedRuntimeSkills: true, supportsModelProfiles: false, supportsAcp: false },
   openclaw_gateway: ALL_FALSE,
+  claudeclaw_gateway: ALL_FALSE,
 };
 
 /**

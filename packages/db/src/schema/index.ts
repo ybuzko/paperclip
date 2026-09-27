@@ -182,4 +182,5 @@ export {
   fleetThrottleStates,
   fleetCalibration,
   fleetSettings,
+  fleetDispatchState,
 } from "./fleet.js";

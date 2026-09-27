@@ -65,6 +65,11 @@
     "publishFromCi": true
   },
   {
+    "dir": "packages/adapters/claudeclaw-gateway",
+    "name": "@paperclipai/adapter-claudeclaw-gateway",
+    "publishFromCi": false
+  },
+  {
     "dir": "packages/shared",
     "name": "@paperclipai/shared",
     "publishFromCi": true

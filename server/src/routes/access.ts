@@ -827,6 +827,60 @@ export function normalizeAgentDefaultsForJoin(input: {
 
     return { normalized, diagnostics, fatalErrors };
   }
+  if (input.adapterType === "claudeclaw_gateway") {
+    if (!isPlainObject(input.defaultsPayload)) {
+      diagnostics.push({
+        code: "claudeclaw_gateway_defaults_missing",
+        level: "info",
+        message: "No claudeclaw config was provided in agentDefaultsPayload; set url and apiToken in the agent settings before assigning work.",
+      });
+      return { normalized: null as Record<string, unknown> | null, diagnostics, fatalErrors };
+    }
+    const defaults = input.defaultsPayload as Record<string, unknown>;
+    const normalized = { ...defaults };
+    const rawUrl = nonEmptyTrimmedString(defaults.url);
+    if (rawUrl) {
+      try {
+        const parsedUrl = new URL(rawUrl);
+        if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+          diagnostics.push({
+            code: "claudeclaw_gateway_url_protocol",
+            level: "warn",
+            message: `claudeclaw url must use http:// or https:// (got ${parsedUrl.protocol}).`,
+          });
+          fatalErrors.push("agentDefaultsPayload.url must use http:// or https:// for claudeclaw_gateway");
+        } else {
+          normalized.url = parsedUrl.toString();
+          diagnostics.push({
+            code: "claudeclaw_gateway_url_configured",
+            level: "info",
+            message: `claudeclaw endpoint set to ${parsedUrl.toString()}`,
+          });
+        }
+      } catch {
+        diagnostics.push({
+          code: "claudeclaw_gateway_url_invalid",
+          level: "warn",
+          message: `Invalid claudeclaw url: ${rawUrl}`,
+        });
+        fatalErrors.push("agentDefaultsPayload.url is not a valid URL");
+      }
+    } else {
+      diagnostics.push({
+        code: "claudeclaw_gateway_url_missing",
+        level: "warn",
+        message: "claudeclaw url is missing; set it in the agent settings before assigning work.",
+      });
+    }
+    if (!nonEmptyTrimmedString(defaults.apiToken)) {
+      diagnostics.push({
+        code: "claudeclaw_gateway_api_token_missing",
+        level: "warn",
+        message: "claudeclaw apiToken is missing; set it in the agent settings before assigning work.",
+      });
+    }
+    return { normalized, diagnostics, fatalErrors };
+  }
   if (input.adapterType !== "openclaw_gateway") {
     const normalized = isPlainObject(input.defaultsPayload)
       ? (input.defaultsPayload as Record<string, unknown>)
@@ -1077,7 +1131,10 @@ export async function prepareAgentDefaultsPayloadForJoinPersistence(input: {
   normalized: Record<string, unknown> | null;
   actor?: { userId?: string | null; agentId?: string | null };
 }): Promise<Record<string, unknown> | null> {
-  if (input.adapterType !== "hermes_gateway" || !input.normalized) {
+  if (
+    (input.adapterType !== "hermes_gateway" && input.adapterType !== "claudeclaw_gateway") ||
+    !input.normalized
+  ) {
     return input.normalized;
   }
 

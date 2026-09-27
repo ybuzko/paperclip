@@ -1,412 +1,84 @@
 import { describe, expect, it } from "vitest";
-import {
-  computePace,
-  decideThrottle,
-  isStale,
-  latestSnapshotByWindow,
-  nextSenseDueAt,
-  weeklyDayIndex,
-} from "./policy.js";
-import { DEFAULT_GOVERNOR_PARAMS, type LimitSnapshot, type ThrottleState } from "./types.js";
+import { capFor, decideThrottle, latestSnapshotByWindow, nextSenseDueAt } from "./policy.js";
+import { DEFAULT_GOVERNOR_PARAMS, type LimitSnapshot } from "./types.js";
 
-const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-const SEVEN_DAYS_MS = 7 * ONE_DAY_MS;
-const NOW = new Date("2026-09-14T12:00:00.000Z");
-const params = DEFAULT_GOVERNOR_PARAMS;
-
-/** A seven_day snapshot whose window is `elapsedFraction` of the way through, at `usedPct`. */
-function sevenDaySnapshot(opts: {
-  usedPct: number | null;
-  elapsedFraction?: number | null;
-  resetsAt?: Date | null;
-  observedAt?: Date;
-}): LimitSnapshot {
-  const resetsAt =
-    opts.resetsAt !== undefined
-      ? opts.resetsAt
-      : opts.elapsedFraction == null
-        ? null
-        : new Date(NOW.getTime() + (1 - opts.elapsedFraction) * SEVEN_DAYS_MS);
-  return {
-    window: "seven_day",
-    usedPct: opts.usedPct,
-    resetsAt,
-    observedAt: opts.observedAt ?? NOW,
-    source: "statusline",
-  };
+const schedule = DEFAULT_GOVERNOR_PARAMS.capSchedules.anthropic!.seven_day!;
+const now = new Date("2026-09-20T10:00:00Z");
+const reset = new Date("2026-09-20T13:00:00Z");
+function snapshot(window: string, usedPct: number | null, resetsAt: Date | null = reset, observedAt = now): LimitSnapshot {
+  return { provider: "anthropic", window, modelScope: null, usedPct, resetsAt, observedAt, source: "test" };
 }
-
-function fiveHourSnapshot(usedPct: number | null, observedAt: Date = NOW): LimitSnapshot {
-  return {
-    window: "five_hour",
-    usedPct,
-    resetsAt: new Date(NOW.getTime() + 2 * 60 * 60 * 1000),
-    observedAt,
-    source: "statusline",
-  };
+function decide(five = 20, weekly = 50, options: {now?: Date; previousState?: "OPEN"|"CAPPED"|"RED"|"STALE"|null; previousCapPct?: number; extra?: LimitSnapshot[]; weeklyReset?: Date|null; observedAt?: Date} = {}) {
+  return decideThrottle({
+    snapshots: [snapshot("five_hour", five, reset, options.observedAt), snapshot("seven_day", weekly, options.weeklyReset === undefined ? reset : options.weeklyReset, options.observedAt), ...(options.extra ?? [])],
+    previousState: options.previousState ?? null, previousCapPct: options.previousCapPct, now: options.now ?? now,
+  });
 }
+const local = (date: Date) => new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/Los_Angeles", weekday: "short", hour: "numeric", minute: "2-digit", timeZoneName: "short",
+}).format(date).replace(",", "");
 
-function bucketSnapshot(
-  window: "seven_day_sonnet" | "seven_day_opus",
-  usedPct: number,
-  observedAt: Date = NOW,
-): LimitSnapshot {
-  return {
-    window,
-    usedPct,
-    resetsAt: new Date(NOW.getTime() + 3 * ONE_DAY_MS),
-    observedAt,
-    source: "statusline",
-  };
-}
-
-function freshSnapshots(overrides: {
-  fiveHourPct?: number;
-  usedPct?: number;
-  elapsedFraction?: number;
-  extra?: LimitSnapshot[];
-}): LimitSnapshot[] {
-  return [
-    fiveHourSnapshot(overrides.fiveHourPct ?? 40),
-    sevenDaySnapshot({
-      usedPct: overrides.usedPct ?? 50,
-      elapsedFraction: overrides.elapsedFraction ?? 0.5,
-    }),
-    ...(overrides.extra ?? []),
-  ];
-}
-
-describe("latestSnapshotByWindow", () => {
-  it("keeps the newest snapshot per window", () => {
-    const older = fiveHourSnapshot(10, new Date(NOW.getTime() - 60_000));
-    const newer = fiveHourSnapshot(20, NOW);
-    const map = latestSnapshotByWindow([older, newer]);
-    expect(map.get("five_hour")).toBe(newer);
-  });
-});
-
-describe("isStale", () => {
-  it("is stale when there is no snapshot", () => {
-    expect(isStale(undefined, NOW, params)).toBe(true);
-  });
-
-  it("is stale when older than stale_after", () => {
-    const snap = fiveHourSnapshot(10, new Date(NOW.getTime() - params.staleAfterMs - 1));
-    expect(isStale(snap, NOW, params)).toBe(true);
-  });
-
-  it("is not stale when within stale_after", () => {
-    const snap = fiveHourSnapshot(10, new Date(NOW.getTime() - params.staleAfterMs + 1));
-    expect(isStale(snap, NOW, params)).toBe(false);
-  });
-});
-
-describe("computePace", () => {
-  it("is 1.0 on plan (50% used at 50% elapsed)", () => {
-    const snap = sevenDaySnapshot({ usedPct: 50, elapsedFraction: 0.5 });
-    expect(computePace(snap, NOW)).toBeCloseTo(1.0, 5);
-  });
-
-  it("is > 1.0 when over pace", () => {
-    const snap = sevenDaySnapshot({ usedPct: 70, elapsedFraction: 0.5 });
-    expect(computePace(snap, NOW)).toBeCloseTo(1.4, 5);
-  });
-
-  it("is < 1.0 when under pace", () => {
-    const snap = sevenDaySnapshot({ usedPct: 30, elapsedFraction: 0.5 });
-    expect(computePace(snap, NOW)).toBeCloseTo(0.6, 5);
-  });
-
-  it("is null when usedPct is missing", () => {
-    const snap = sevenDaySnapshot({ usedPct: null, elapsedFraction: 0.5 });
-    expect(computePace(snap, NOW)).toBeNull();
-  });
-
-  it("is null when resetsAt is missing", () => {
-    const snap = sevenDaySnapshot({ usedPct: 50, resetsAt: null });
-    expect(computePace(snap, NOW)).toBeNull();
-  });
-
-  it("clamps the elapsed fraction to 0.01 right after a reset", () => {
-    // Window started 1 minute ago: raw elapsed fraction ~= 0.0000992, clamped to 0.01.
-    const snap = sevenDaySnapshot({
-      usedPct: 5,
-      resetsAt: new Date(NOW.getTime() - 60_000 + SEVEN_DAYS_MS),
-    });
-    expect(computePace(snap, NOW)).toBeCloseTo(5 / (0.01 * 100), 5);
-  });
-});
-
-describe("weeklyDayIndex", () => {
+describe("cap schedule", () => {
   it.each([
-    { elapsedFraction: 0 / 7, expected: 1 },
-    { elapsedFraction: 3.5 / 7, expected: 4 },
-    { elapsedFraction: 6.99 / 7, expected: 7 },
-  ])("maps elapsed fraction $elapsedFraction to day $expected", ({ elapsedFraction, expected }) => {
-    const snap = sevenDaySnapshot({ usedPct: 50, elapsedFraction });
-    expect(weeklyDayIndex(snap, NOW)).toBe(expected);
+    ["ordinary PDT", "2026-09-20T13:00:00Z", "Sat 8:00 PM PDT", "Sun 1:00 AM PDT"],
+    ["ordinary PST", "2026-12-20T14:00:00Z", "Sat 8:00 PM PST", "Sun 1:00 AM PST"],
+    ["spring transition", "2026-03-08T13:00:00Z", "Sat 7:00 PM PST", "Sun 12:00 AM PST"],
+    ["fall transition", "2026-11-01T14:00:00Z", "Sat 9:00 PM PDT", "Sun 1:00 AM PST"],
+  ])("uses elapsed instants across %s", (_name, resetIso, firstLocal, secondLocal) => {
+    const resetAt = new Date(resetIso);
+    const first = new Date(resetAt.getTime() - 10 * 3_600_000);
+    const second = new Date(resetAt.getTime() - 5 * 3_600_000);
+    expect(local(first)).toBe(firstLocal);
+    expect(local(second)).toBe(secondLocal);
+    expect(capFor(new Date(first.getTime() - 1), resetAt, schedule).capPct).toBe(70);
+    expect(capFor(first, resetAt, schedule)).toMatchObject({capPct:70,segmentIndex:0,nextChangeAt:new Date(first.getTime()+1)});
+    expect(capFor(new Date(first.getTime() + 1), resetAt, schedule).capPct).toBe(80);
+    expect(capFor(second, resetAt, schedule)).toMatchObject({capPct:80,segmentIndex:1,nextChangeAt:new Date(second.getTime()+1)});
+    expect(capFor(new Date(second.getTime() + 1), resetAt, schedule)).toMatchObject({capPct:99,segmentIndex:2,nextChangeAt:null});
   });
-
-  it("clamps beyond day 7", () => {
-    const snap = sevenDaySnapshot({
-      usedPct: 50,
-      resetsAt: new Date(NOW.getTime() - ONE_DAY_MS), // window "should" have already reset
-    });
-    expect(weeklyDayIndex(snap, NOW)).toBe(7);
-  });
-
-  it("is null without resetsAt", () => {
-    const snap = sevenDaySnapshot({ usedPct: 50, resetsAt: null });
-    expect(weeklyDayIndex(snap, NOW)).toBeNull();
-  });
-});
-
-describe("decideThrottle: state transitions (no previous state)", () => {
-  it.each([
-    { name: "GREEN on plan", fiveHourPct: 40, usedPct: 50, elapsedFraction: 0.5, expected: "GREEN" },
-    { name: "AMBER at amber_pace", fiveHourPct: 40, usedPct: 60, elapsedFraction: 0.5, expected: "AMBER" }, // pace 1.2
-    { name: "RED at red_pace", fiveHourPct: 40, usedPct: 70, elapsedFraction: 0.5, expected: "RED" }, // pace 1.4
-  ] satisfies { name: string; fiveHourPct: number; usedPct: number; elapsedFraction: number; expected: ThrottleState }[])(
-    "$name",
-    ({ fiveHourPct, usedPct, elapsedFraction, expected }) => {
-      const decision = decideThrottle({
-        snapshots: freshSnapshots({ fiveHourPct, usedPct, elapsedFraction }),
-        previousState: null,
-        params,
-        now: NOW,
-      });
-      expect(decision.state).toBe(expected);
-      expect(decision.stale).toBe(false);
-    },
-  );
-
-  it("RED from 5h regardless of good pace", () => {
-    const decision = decideThrottle({
-      snapshots: freshSnapshots({ fiveHourPct: 95, usedPct: 45, elapsedFraction: 0.5 }), // pace 0.9, on plan
-      previousState: null,
-      params,
-      now: NOW,
-    });
-    expect(decision.state).toBe("RED");
-    expect(decision.reason).toMatch(/5h/i);
-    expect(decision.launchParameters.maxConcurrency).toBe(0);
-  });
-
-  it("ACCELERATE when pace is low and the weekly day is late enough", () => {
-    const decision = decideThrottle({
-      snapshots: freshSnapshots({ fiveHourPct: 30, usedPct: 40, elapsedFraction: 4 / 7 }), // pace ~0.7, day 5
-      previousState: null,
-      params,
-      now: NOW,
-    });
-    expect(decision.state).toBe("ACCELERATE");
-    expect(decision.holds.releaseP3Sweepers).toBe(true);
-  });
-
-  it("does not ACCELERATE before accel_earliest_day even with low pace", () => {
-    const decision = decideThrottle({
-      snapshots: freshSnapshots({ fiveHourPct: 30, usedPct: 20, elapsedFraction: 2 / 7 }), // pace 0.7, day 3
-      previousState: null,
-      params,
-      now: NOW,
-    });
-    expect(decision.state).toBe("GREEN");
-  });
-
-  it("marks AMBER and stale when the seven_day snapshot is too old", () => {
-    const staleSevenDay = sevenDaySnapshot({
-      usedPct: 50,
-      elapsedFraction: 0.5,
-      observedAt: new Date(NOW.getTime() - params.staleAfterMs - 1),
-    });
-    const decision = decideThrottle({
-      snapshots: [fiveHourSnapshot(40), staleSevenDay],
-      previousState: null,
-      params,
-      now: NOW,
-    });
-    expect(decision.state).toBe("AMBER");
-    expect(decision.stale).toBe(true);
-    expect(decision.reason).toMatch(/stale/i);
-    expect(decision.reason).toMatch(/seven_day/);
-  });
-
-  it("keeps RED from a fresh 5h breach even when the seven_day snapshot is stale", () => {
-    const staleSevenDay = sevenDaySnapshot({
-      usedPct: 40,
-      elapsedFraction: 0.5,
-      observedAt: new Date(NOW.getTime() - params.staleAfterMs - 1),
-    });
-    const decision = decideThrottle({
-      snapshots: [fiveHourSnapshot(params.red5h), staleSevenDay],
-      previousState: null,
-      params,
-      now: NOW,
-    });
-    expect(decision.state).toBe("RED");
-    expect(decision.stale).toBe(true);
-    expect(decision.holds.allNonP0Dispatch).toBe(true);
-    expect(decision.reason).toMatch(/red_5h/);
-  });
-
-  it("does not let a STALE 5h reading force RED (stale wins as AMBER)", () => {
-    const decision = decideThrottle({
-      snapshots: [
-        fiveHourSnapshot(99, new Date(NOW.getTime() - params.staleAfterMs - 1)),
-        sevenDaySnapshot({ usedPct: 40, elapsedFraction: 0.5 }),
-      ],
-      previousState: null,
-      params,
-      now: NOW,
-    });
-    expect(decision.state).toBe("AMBER");
-    expect(decision.stale).toBe(true);
-  });
-
-  it("marks AMBER and stale when the five_hour snapshot is missing entirely", () => {
-    const decision = decideThrottle({
-      snapshots: [sevenDaySnapshot({ usedPct: 50, elapsedFraction: 0.5 })],
-      previousState: null,
-      params,
-      now: NOW,
-    });
-    expect(decision.state).toBe("AMBER");
-    expect(decision.stale).toBe(true);
-    expect(decision.reason).toMatch(/five_hour/);
-  });
-
-  it("activates the interactive floor on GREEN when 5h >= floor_5h but < red_5h", () => {
-    const decision = decideThrottle({
-      snapshots: freshSnapshots({ fiveHourPct: 85, usedPct: 50, elapsedFraction: 0.5 }),
-      previousState: null,
-      params,
-      now: NOW,
-    });
-    expect(decision.state).toBe("GREEN");
-    expect(decision.floorActive).toBe(true);
-    expect(decision.holds.newNonP0WorkerLaunches).toBe(true);
-    // Floor does not imply the other, state-driven holds.
-    expect(decision.holds.allNonP0Dispatch).toBe(false);
-  });
-
-  it("excludes a model whose weekly bucket is at/above bucket_hold", () => {
-    const decision = decideThrottle({
-      snapshots: freshSnapshots({
-        fiveHourPct: 40,
-        usedPct: 50,
-        elapsedFraction: 0.5,
-        extra: [bucketSnapshot("seven_day_sonnet", 92)],
-      }),
-      previousState: null,
-      params,
-      now: NOW,
-    });
-    expect(decision.bucketHolds).toEqual(["seven_day_sonnet"]);
-    expect(decision.launchParameters.excludedModels).toEqual(["sonnet"]);
-  });
-
-  it("sets amber_model/amber_effort and reduced concurrency for the coder under AMBER, evaluator unchanged", () => {
-    const decision = decideThrottle({
-      snapshots: freshSnapshots({ fiveHourPct: 40, usedPct: 60, elapsedFraction: 0.5 }), // pace 1.2
-      previousState: null,
-      params,
-      now: NOW,
-    });
-    expect(decision.state).toBe("AMBER");
-    expect(decision.launchParameters.coder).toEqual({ model: "sonnet", effort: "medium" });
-    expect(decision.launchParameters.evaluator).toEqual({ model: "sonnet", effort: null });
-    expect(decision.launchParameters.maxConcurrency).toBe(
-      Math.max(1, params.maxConcurrency - params.amberConcurrencyStep),
-    );
-    expect(decision.holds.newP2PlusDispatch).toBe(true);
+  it("wakes sensing at the next cap change", () => {
+    const resetAt = new Date(now.getTime()+10*3_600_000+60_000);
+    const latest = latestSnapshotByWindow([snapshot("seven_day", 30, resetAt)]);
+    expect(nextSenseDueAt(latest, now, DEFAULT_GOVERNOR_PARAMS)).toEqual(new Date(now.getTime()+60_001));
   });
 });
 
-describe("decideThrottle: hysteresis (FR-4.1)", () => {
-  it("holds at RED when pace has not cleared the red_pace threshold by the hysteresis band", () => {
-    // redPace=1.35, hysteresis=5pp -> needs pace < 1.30 to clear. 1.32 does not clear.
-    // five_hour is well clear (80 < 85) but pace is not, so overall not cleared.
-    const decision = decideThrottle({
-      snapshots: freshSnapshots({ fiveHourPct: 80, usedPct: 66, elapsedFraction: 0.5 }), // pace 1.32
-      previousState: "RED",
-      params,
-      now: NOW,
+describe("cap-based throttle", () => {
+  it("enters CAPPED, holds hysteresis, then releases on clearance", () => {
+    expect(decide(20, 99)).toMatchObject({
+      state: "CAPPED", launchParameters: { maxConcurrency: 0 },
+      holds: { newP2PlusDispatch: true, allNonP0Dispatch: true, newNonP0WorkerLaunches: true },
     });
-    expect(decision.state).toBe("RED");
-    expect(decision.reason).toMatch(/hysteresis/i);
+    expect(decide(20, 97, {previousState:"CAPPED", previousCapPct:99}).state).toBe("CAPPED");
+    expect(decide(20, 94, {previousState:"CAPPED", previousCapPct:99}).state).toBe("OPEN");
   });
-
-  it("steps down from RED once pace and 5h have both cleared their thresholds by the hysteresis band", () => {
-    const decision = decideThrottle({
-      snapshots: freshSnapshots({ fiveHourPct: 70, usedPct: 62.5, elapsedFraction: 0.5 }), // pace 1.25, cleared
-      previousState: "RED",
-      params,
-      now: NOW,
+  it("releases a CAPPED state at 75 when the cap steps from 70 to 80", () => {
+    const at = new Date("2026-09-20T03:00:00.001Z");
+    const result = decide(20, 75, {now:at, previousState:"CAPPED", previousCapPct:70, observedAt:at});
+    expect(result).toMatchObject({state:"OPEN",capPct:80});
+  });
+  it("gives STALE precedence over RED and CAPPED; RED precedes CAPPED", () => {
+    expect(decide(95, 99).state).toBe("RED");
+    expect(decide(95, 99, {observedAt:new Date(now.getTime()-20*60_000)}).state).toBe("STALE");
+    expect(decide(95, 99, {weeklyReset:null}).state).toBe("STALE");
+  });
+  it("excludes every held model slug, including Fable", () => {
+    const result = decide(20, 50, {extra:[snapshot("seven_day_model:fable",90),snapshot("seven_day_sonnet",91),snapshot("seven_day_surface:claude_code",99)]});
+    expect(result.excludedModels).toEqual(["fable","sonnet"]);
+    expect(result.launchParameters.excludedModels).toEqual(result.excludedModels);
+  });
+  it("does not borrow legacy Anthropic snapshots for another provider", () => {
+    const result = decideThrottle({
+      provider: "openai", now,
+      previousState: null,
+      snapshots: [snapshot("five_hour", 10), snapshot("seven_day", 20)],
+      params: { ...DEFAULT_GOVERNOR_PARAMS, capSchedules: { ...DEFAULT_GOVERNOR_PARAMS.capSchedules, openai: { seven_day: schedule } } },
     });
-    expect(decision.state).toBe("AMBER");
+    expect(result.state).toBe("STALE");
   });
-
-  it("holds at AMBER when pace has not cleared the amber_pace threshold by the hysteresis band", () => {
-    // amberPace=1.15, hysteresis=5pp -> needs pace < 1.10 to clear. 1.12 does not clear.
-    const decision = decideThrottle({
-      snapshots: freshSnapshots({ fiveHourPct: 40, usedPct: 56, elapsedFraction: 0.5 }), // pace 1.12
-      previousState: "AMBER",
-      params,
-      now: NOW,
-    });
-    expect(decision.state).toBe("AMBER");
-    expect(decision.reason).toMatch(/hysteresis/i);
-  });
-
-  it("releases from AMBER to GREEN once pace has cleared the amber_pace threshold by the hysteresis band", () => {
-    const decision = decideThrottle({
-      snapshots: freshSnapshots({ fiveHourPct: 40, usedPct: 52.5, elapsedFraction: 0.5 }), // pace 1.05, cleared
-      previousState: "AMBER",
-      params,
-      now: NOW,
-    });
-    expect(decision.state).toBe("GREEN");
-  });
-
-  it("escalates immediately from GREEN to RED without waiting on hysteresis", () => {
-    const decision = decideThrottle({
-      snapshots: freshSnapshots({ fiveHourPct: 40, usedPct: 70, elapsedFraction: 0.5 }), // pace 1.4
-      previousState: "GREEN",
-      params,
-      now: NOW,
-    });
-    expect(decision.state).toBe("RED");
-  });
-});
-
-describe("nextSenseDueAt", () => {
-  it("returns now + sense_interval when nothing resets soon", () => {
-    const snapshots = freshSnapshots({});
-    const latest = latestSnapshotByWindow(snapshots);
-    const due = nextSenseDueAt(latest, NOW, params);
-    expect(due.getTime()).toBe(NOW.getTime() + params.senseIntervalMs);
-  });
-
-  it("re-senses within 60s of a reset that falls inside the interval", () => {
-    const resetsAt = new Date(NOW.getTime() + 2 * 60 * 1000);
-    const snapshots = [
-      { ...fiveHourSnapshot(40), resetsAt },
-      sevenDaySnapshot({ usedPct: 50, elapsedFraction: 0.5, resetsAt: new Date(NOW.getTime() + ONE_DAY_MS) }),
-    ];
-    const latest = latestSnapshotByWindow(snapshots);
-    const due = nextSenseDueAt(latest, NOW, params);
-    expect(due.getTime()).toBe(resetsAt.getTime() + 60_000);
-  });
-
-  it("picks the earliest reset when multiple windows reset within the interval", () => {
-    const earlierReset = new Date(NOW.getTime() + 60 * 1000);
-    const laterReset = new Date(NOW.getTime() + 3 * 60 * 1000);
-    const snapshots = [
-      { ...fiveHourSnapshot(40), resetsAt: laterReset },
-      sevenDaySnapshot({ usedPct: 50, elapsedFraction: 0.5, resetsAt: earlierReset }),
-    ];
-    const latest = latestSnapshotByWindow(snapshots);
-    const due = nextSenseDueAt(latest, NOW, params);
-    expect(due.getTime()).toBe(earlierReset.getTime() + 60_000);
+  it("keeps the five-hour floor independent of OPEN and CAPPED", () => {
+    expect(decide(85, 50)).toMatchObject({state:"OPEN",floorActive:true,launchParameters:{maxConcurrency:0}});
+    expect(decide(85, 99)).toMatchObject({state:"CAPPED",floorActive:true});
+    expect(decide(20, 50)).toMatchObject({state:"OPEN",floorActive:false,launchParameters:{maxConcurrency:1}});
   });
 });

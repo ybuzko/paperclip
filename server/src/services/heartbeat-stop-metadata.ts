@@ -40,6 +40,7 @@ function hasOwn(record: Record<string, unknown>, key: string) {
 }
 
 function defaultTimeoutSecForAdapter(adapterType: string) {
+  if (adapterType === "claudeclaw_gateway") return 600;
   return adapterType === "openclaw_gateway" ? 120 : 0;
 }
 
