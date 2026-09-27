@@ -15,13 +15,13 @@ reports the cap, next cap change, state, model exclusions, floor, and holds.
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `capSchedules.anthropic.seven_day` | 70%; 80% inside T−10h; 99% inside T−5h | Weekly utilization cap. Strict boundaries: at exactly T−10h the cap is still 70%; one millisecond later it is 80%. |
-| `floor5h` | 80 | Independently holds non-P0 worker launches. |
-| `red5h` | 90 | Enters RED when a fresh five-hour reading reaches this percentage. |
-| `hysteresisPp` | 5 | CAPPED clears at or below cap minus 5 percentage points; a cap step-up also clears it. |
+| `floor5h` | 80 | Independently holds new worker launches for every class. |
+| `red5h` | 90 | Enters RED when a fresh five-hour reading reaches this percentage and required sensing is not STALE. |
+| `hysteresisPp` | 5 | CAPPED clears at or below cap minus 5 percentage points; a cap step-up reevaluates usage against the new cap. |
 | `bucketHoldPct` | 90 | Excludes model slugs whose model-scoped weekly usage reaches this percentage. |
 | `staleAfterMs` | 15 min | Maximum sensing age for required five-hour and weekly windows. |
 | `senseIntervalMs` | 5 min | Normal sensing cadence; a cap step may wake it earlier. |
-| `maxConcurrency` | 1 | Non-P0 worker concurrency when the floor is inactive. |
+| `maxConcurrency` | 1 | Worker concurrency across all classes when the floor and throttle holds are inactive. |
 | `paramsVersion` | `v1-cap-schedule` | Audit version. |
 
 Schedule hours are elapsed time before the reset instant, not fixed wall-clock
@@ -36,8 +36,9 @@ single null base segment first, followed by positive hour offsets in strictly
 descending order. Caps must be finite percentages from 0 to 100.
 
 The pure policy emits OPEN, CAPPED, RED, or STALE. STALE takes precedence over
-RED; RED takes precedence over CAPPED. `previousCapPct` allows the caller to
-release CAPPED when the scheduled cap steps up. `pace` remains null solely for
+RED; RED takes precedence over CAPPED. `previousCapPct` lets the caller
+reevaluate CAPPED against a stepped-up cap; usage at or above the new cap
+remains CAPPED. `pace` remains null solely for
 the existing persistence column. Launch parameters contain only model
 exclusions and maximum concurrency.
 
