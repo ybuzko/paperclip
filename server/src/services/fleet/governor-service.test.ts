@@ -349,7 +349,7 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
 
       const result = await svc.evaluate();
       expect(result.decision.stale).toBe(true);
-      expect(result.decision.state).toBe("AMBER");
+      expect(result.decision.state).toBe("STALE");
     });
   });
 
@@ -365,7 +365,7 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
         },
         {
           key: GOVERNOR_PARAMS_SETTINGS_KEY,
-          value: { amberPace: 2.5 },
+          value: { amberPace: 2.5, capSchedules: { anthropic: { seven_day: { timeZone: "America/Los_Angeles", segments: [{ beforeResetHours: null, capPct: 65 }, { beforeResetHours: 10, capPct: 80 }, { beforeResetHours: 5, capPct: 99 }] } } } },
           version: "v1",
           updatedAt: new Date(),
           updatedBy: "test-admin",
@@ -384,10 +384,11 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
       const result = await svc.evaluate();
 
       expect(result.mode).toBe("enforce");
-      expect(result.params.amberPace).toBe(2.5);
+      expect(result.params.capSchedules.anthropic?.seven_day?.segments[0]?.capPct).toBe(65);
       // Unset fields still come from the defaults (deep-merge, not replace).
-      expect(result.params.redPace).toBe(DEFAULT_GOVERNOR_PARAMS.redPace);
-      expect(result.params.defaultModels).toEqual(DEFAULT_GOVERNOR_PARAMS.defaultModels);
+      expect(result.params.red5h).toBe(DEFAULT_GOVERNOR_PARAMS.red5h);
+      expect(result.params.capSchedules.anthropic?.seven_day?.segments).toHaveLength(3);
+      expect(Object.hasOwn(result.params, "amberPace")).toBe(false);
 
       const [persisted] = await db.select().from(fleetThrottleStates);
       expect(persisted?.mode).toBe("enforce");
@@ -475,12 +476,7 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
   describe("getAdmission", () => {
     const NOW = new Date("2026-01-02T00:00:00.000Z");
 
-    /**
-     * Windows with elapsedFraction exactly 0.5 (well past the default
-     * minElapsedFraction, and — at weekly day 4 — right at the earliest day
-     * ACCELERATE can trigger, so callers should keep sevenDayPct's implied
-     * pace clearly above accel_pace (0.8) unless ACCELERATE is intended).
-     */
+    /** Quota windows with a reset far enough away to use the base cap. */
     function quotaResult(opts: { fiveHourPct: number; sevenDayPct: number }): ProviderQuotaResult {
       return {
         provider: "anthropic",
@@ -552,41 +548,57 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
       expect(admission.reason).toMatch(/RED/);
     });
 
-    it("enforce mode: the interactive floor blocks even under GREEN", async () => {
+    it("enforce mode: a freshly evaluated STALE state blocks", async () => {
       const companyId = await seedCompany();
-      // 5h at 85% (>= floor_5h 80, < red_5h 90); pace on-plan (45/50=0.9, above
-      // accel_pace so it doesn't ACCELERATE at weekly day 4) -> GREEN with floorActive.
+      await db.insert(fleetSettings).values({
+        key: GOVERNOR_MODE_SETTINGS_KEY, value: { mode: "enforce" }, version: "v1",
+        updatedAt: NOW, updatedBy: "test-admin",
+      });
+      await db.insert(fleetThrottleStates).values({
+        ts: NOW, mode: "enforce", state: "STALE", stale: true, pace: null,
+        fiveHourPct: 10, sevenDayPct: null, floorActive: false,
+        reason: "STALE: weekly snapshot missing", paramsVersion: DEFAULT_GOVERNOR_PARAMS.paramsVersion,
+        inputs: {}, launchParameters: {},
+      });
+      const svc = createFleetGovernorService({ db, logger: fakeLogger(), now: () => NOW });
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
+      expect(admission).toMatchObject({ state: "STALE", allowed: false, wouldBlock: true });
+    });
+
+    it("enforce mode: the interactive floor blocks even under OPEN", async () => {
+      const companyId = await seedCompany();
+      // 5h at 85% activates the floor while weekly usage remains below the cap.
       const svc = await evaluatedService({ fiveHourPct: 85, sevenDayPct: 45, mode: "enforce" });
 
       const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
 
-      expect(admission.state).toBe("GREEN");
+      expect(admission.state).toBe("OPEN");
       expect(admission.allowed).toBe(false);
       expect(admission.reason).toMatch(/floor/i);
     });
 
-    it("enforce mode: AMBER blocks P2 projects but allows P0/P1", async () => {
+    it("enforce mode: CAPPED blocks all project classes", async () => {
       const companyId = await seedCompany();
       const p0 = await seedProject(companyId, "P0");
       const p1 = await seedProject(companyId, "P1");
       const p2 = await seedProject(companyId, "P2");
-      // sevenDayPct 60 at elapsedFraction 0.5 -> pace 1.2 (between amber_pace and red_pace).
-      const svc = await evaluatedService({ fiveHourPct: 40, sevenDayPct: 60, mode: "enforce" });
+      // Weekly usage 75% exceeds the default 70% cap.
+      const svc = await evaluatedService({ fiveHourPct: 40, sevenDayPct: 75, mode: "enforce" });
 
       const admissionP0 = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: p0 });
       const admissionP1 = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: p1 });
       const admissionP2 = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: p2 });
 
-      expect(admissionP0.state).toBe("AMBER");
+      expect(admissionP0.state).toBe("CAPPED");
       expect(admissionP0.projectClass).toBe("P0");
-      expect(admissionP0.allowed).toBe(true);
+      expect(admissionP0.allowed).toBe(false);
 
       expect(admissionP1.projectClass).toBe("P1");
-      expect(admissionP1.allowed).toBe(true);
+      expect(admissionP1.allowed).toBe(false);
 
       expect(admissionP2.projectClass).toBe("P2");
       expect(admissionP2.allowed).toBe(false);
-      expect(admissionP2.reason).toMatch(/AMBER/);
+      expect(admissionP2.reason).toMatch(/CAPPED/);
     });
 
     it("a project with no FLEET_CLASS set, or no projectId at all, defaults to P2", async () => {
@@ -594,7 +606,7 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
       const untaggedProject = await seedProject(companyId, "P0");
       // Overwrite env to omit FLEET_CLASS entirely.
       await db.update(projects).set({ env: {} }).where(eq(projects.id, untaggedProject));
-      const svc = await evaluatedService({ fiveHourPct: 40, sevenDayPct: 50 }); // GREEN
+      const svc = await evaluatedService({ fiveHourPct: 40, sevenDayPct: 50 }); // OPEN
 
       const noProject = await svc.getAdmission({ companyId, agentId: "agent-1" });
       const untagged = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: untaggedProject });
@@ -603,14 +615,14 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
       expect(untagged.projectClass).toBe("P2");
     });
 
-    it("GREEN allows regardless of project class", async () => {
+    it("OPEN allows regardless of project class", async () => {
       const companyId = await seedCompany();
       const p2 = await seedProject(companyId, "P2");
-      const svc = await evaluatedService({ fiveHourPct: 40, sevenDayPct: 45, mode: "enforce" }); // GREEN
+      const svc = await evaluatedService({ fiveHourPct: 40, sevenDayPct: 45, mode: "enforce" }); // OPEN
 
       const admission = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: p2 });
 
-      expect(admission.state).toBe("GREEN");
+      expect(admission.state).toBe("OPEN");
       expect(admission.allowed).toBe(true);
       expect(admission.wouldBlock).toBe(false);
     });
@@ -639,13 +651,13 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
       await db.insert(fleetThrottleStates).values({
         ts: NOW,
         mode: "shadow",
-        state: "GREEN",
+        state: "OPEN",
         stale: false,
         pace: 1.0,
         fiveHourPct: 10,
         sevenDayPct: 50,
         floorActive: false,
-        reason: "GREEN: seeded row for DB-fallback test",
+        reason: "OPEN: seeded row for DB-fallback test",
         paramsVersion: DEFAULT_GOVERNOR_PARAMS.paramsVersion,
         inputs: {},
         launchParameters: {},
@@ -656,7 +668,7 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
 
       const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
 
-      expect(admission.state).toBe("GREEN");
+      expect(admission.state).toBe("OPEN");
       expect(admission.stale).toBe(false);
       expect(admission.allowed).toBe(true);
     });
