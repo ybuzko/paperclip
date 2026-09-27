@@ -14,6 +14,16 @@ function seededNoise(seed: number): () => number {
 }
 
 describe("fitCalibration", () => {
+  it("uses the 95% Student t quantile with n-1 degrees of freedom", () => {
+    const snapshots = [0, 1, 4].map((usedPct, i) => ({ observedAt: at(i * 5), usedPct }));
+    const usage = [5, 10].map((minute) => ({ at: at(minute), weightedUnits: 1 }));
+    const result = fitCalibration(snapshots, usage, 2);
+    expect(result.fit!.pctPerWeightedUnit).toBe(2);
+    expect(result.fit!.n).toBe(2);
+    expect(result.fit!.ci95.lower).toBeCloseTo(2 - 12.706204736, 6);
+    expect(result.fit!.ci95.upper).toBeCloseTo(2 + 12.706204736, 6);
+  });
+
   it("fits a known slope with noisy observations and a Student t interval containing truth", () => {
     const noise = seededNoise(17);
     const snapshots: CalibrationSnapshot[] = [{ observedAt: at(0), usedPct: 0 }];

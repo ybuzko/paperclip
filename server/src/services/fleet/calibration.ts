@@ -46,11 +46,19 @@ function validSnapshot(value: CalibrationSnapshot): { at: number; pct: number } 
 }
 
 function resetBoundaries(snapshots: readonly CalibrationSnapshot[]): number[] {
-  return snapshots.map((point) => timestamp(point?.resetsAt)).filter((at): at is number => at !== null);
+  return [...new Set(snapshots.map((point) => timestamp(point?.resetsAt))
+    .filter((at): at is number => at !== null))].sort((a, b) => a - b);
 }
 
 function crossesReset(from: number, to: number, boundaries: readonly number[]): boolean {
-  return boundaries.some((reset) => from < reset && reset <= to);
+  let low = 0;
+  let high = boundaries.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (boundaries[middle]! <= from) low = middle + 1;
+    else high = middle;
+  }
+  return low < boundaries.length && boundaries[low]! <= to;
 }
 
 function intervalDelta(
@@ -147,11 +155,17 @@ export function fitCalibration(
   const pairs: { units: number; delta: number }[] = [];
   let totalMovement = 0;
   let coveredMovement = 0;
+  let usageCursor = 0;
   for (let i = 1; i < snapshots.length; i++) {
     const interval = intervalDelta(snapshots[i - 1]!, snapshots[i]!, boundaries);
     if (!interval) continue;
-    const units = points.reduce((sum, point) => sum + (
-      interval.from < point.at && point.at <= interval.to ? point.units : 0), 0);
+    // Inputs are ordered, so each usage point is visited at most once.
+    while (usageCursor < points.length && points[usageCursor]!.at <= interval.from) usageCursor++;
+    let units = 0;
+    while (usageCursor < points.length && points[usageCursor]!.at <= interval.to) {
+      units += points[usageCursor]!.units;
+      usageCursor++;
+    }
     totalMovement += interval.delta;
     if (units <= 0) continue;
     coveredMovement += interval.delta;
