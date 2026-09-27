@@ -134,3 +134,17 @@ slugs.
 `providers[provider].snapshots`. The top-level `snapshots` array remains
 available during the transition and carries the same rows, including explicit
 `modelScope: null` where a window is not model-scoped.
+
+## Weights
+
+`weights.ts` provides pure token weighting through `weightedUnits()` and
+`loadWeightTable()`. The default per-token ratios are seeded from Anthropic
+API list-price ratios as of 2026-09 and include an unfitted OpenAI placeholder.
+They are proxy ratios for metering and fairness, not current billing facts or
+currency amounts; operators may replace them with fitted values through the
+`fleet_settings` `provider_weights` JSON setting. Overrides deep-merge by
+provider, model, and token type, so unspecified defaults remain available.
+Model selection uses an exact id first, then the longest matching prefix,
+then the provider's `*` entry. An unknown provider contributes zero and should
+be logged once by the caller. Invalid negative or non-finite override weights
+are ignored, and invalid token counts contribute zero.
