@@ -3,9 +3,12 @@
  * pure functions, no I/O. See ./DISPATCH.md for the module contract, the
  * JQL shapes, and the decision rules in prose.
  *
- * The dispatch loop never chooses tickets; it only counts what is ready for
- * a supervisor and decides, from the governor's throttle state and the
- * project's class, whether it is allowed to nudge that supervisor awake.
+ * The dispatch loop counts what is ready for a supervisor, picks the ONE
+ * item a nudge is about ({@link selectAssignment}), and decides, from the
+ * governor's throttle state and the project's class, whether it is allowed to
+ * nudge that supervisor awake ({@link decideDispatch}). It also parses the
+ * supervisor's `fleet-ack:` line ({@link parseFleetAck}) and decides what to
+ * do with a declined assignment ({@link decideDeclineReassignment}).
  */
 
 /** Mirrors server/src/services/fleet/types.ts's `ProjectClass` (kept local so this module stays import-free). Sourced from the project's env, key `FLEET_CLASS`; defaults to `P2`. */
@@ -93,7 +96,13 @@ export function countsFingerprint(counts: Pick<ReadyWorkCounts, "readyTasks" | "
   return `${counts.readyTasks}:${counts.epicsToExplode}:${counts.epicsToClose}`;
 }
 
-export type ThrottleStateLike = "GREEN" | "AMBER" | "RED" | "ACCELERATE";
+/**
+ * The governor's throttle state names. `OPEN | CAPPED | RED | STALE` are what
+ * ./policy.ts's `decideThrottle` emits today (see ./types.ts `ThrottleState`);
+ * `GREEN | AMBER | ACCELERATE` are the pre-2026-09-27 names, still accepted so
+ * old `fleet_throttle_states` rows keep their original meaning below.
+ */
+export type ThrottleStateLike = "OPEN" | "CAPPED" | "RED" | "STALE" | "GREEN" | "AMBER" | "ACCELERATE";
 
 export interface DispatchGovernorInput {
   state: ThrottleStateLike;
@@ -102,11 +111,176 @@ export interface DispatchGovernorInput {
   floor5h: number;
 }
 
+export type DispatchAssignmentKind = "task" | "epic_explode" | "epic_close";
+export type DispatchAckOutcome = "done" | "declined" | "partial";
+
 export interface DispatchAckInput {
   at: Date;
   worked: string;
-  kind: "task" | "epic_explode" | "epic_close";
-  outcome: "done" | "declined" | "partial";
+  /** Only present on the legacy `kind=` ack form. */
+  kind?: DispatchAssignmentKind | null;
+  outcome: DispatchAckOutcome;
+}
+
+/** The ack line the v2 nudge asks for. */
+export const FLEET_ACK_FORMAT_V2 = "fleet-ack: worked=<KEY> outcome=<done|declined|partial>";
+
+/**
+ * Matches both the v2 ack (`fleet-ack: worked=KEY outcome=X`) and the legacy
+ * form with a `kind=` field in between (`fleet-ack: worked=KEY kind=K outcome=X`).
+ */
+const FLEET_ACK_RE =
+  /fleet-ack:\s*worked=(\S+?)\s+(?:kind=(task|epic_explode|epic_close)\s+)?outcome=(done|declined|partial)\b/g;
+
+export interface ParsedFleetAck {
+  worked: string;
+  kind: DispatchAssignmentKind | null;
+  outcome: DispatchAckOutcome;
+}
+
+/**
+ * Parses the LAST `fleet-ack:` line in `text` (the supervisor is asked to end
+ * its reply with it), or null when there is none. Surrounding markdown such as
+ * backticks after the outcome is ignored; a key wrapped in backticks/quotes is
+ * unwrapped.
+ */
+export function parseFleetAck(text: string | null | undefined): ParsedFleetAck | null {
+  if (!text) return null;
+  let last: RegExpExecArray | null = null;
+  for (const match of text.matchAll(FLEET_ACK_RE)) last = match as RegExpExecArray;
+  if (!last) return null;
+  const worked = last[1]!.replace(/^[`'"*]+|[`'"*,;.]+$/g, "");
+  if (!worked) return null;
+  return {
+    worked,
+    kind: (last[2] as DispatchAssignmentKind | undefined) ?? null,
+    outcome: last[3] as DispatchAckOutcome,
+  };
+}
+
+/** True when `key` looks like a Jira issue key (`ABC-123`). */
+export function isJiraIssueKey(key: string): boolean {
+  return JIRA_KEY_RE.test(key);
+}
+
+/** One ready-work candidate as returned by the Jira search (see jira-client.ts `JiraIssueDetail`). */
+export interface ReadyIssueCandidate {
+  key: string;
+  summary: string | null;
+  statusName: string | null;
+  created: string | null;
+  updated: string | null;
+}
+
+/** The ONE item a v2 nudge is about. */
+export interface DispatchAssignment {
+  key: string;
+  summary: string;
+  status: string;
+  kind: DispatchAssignmentKind;
+}
+
+function timeOrInfinity(value: string | null): number {
+  if (!value) return Number.POSITIVE_INFINITY;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+}
+
+function taskStatusRank(statusName: string | null): number {
+  const normalized = (statusName ?? "").trim().toLowerCase();
+  if (normalized === "in progress") return 0;
+  if (normalized === "to do") return 1;
+  // Any other configured ready status (JIRA_READY_STATUSES override).
+  return 2;
+}
+
+function compareByTimeThenKey(a: ReadyIssueCandidate, b: ReadyIssueCandidate, field: "created" | "updated"): number {
+  const ta = timeOrInfinity(a[field]);
+  const tb = timeOrInfinity(b[field]);
+  if (ta !== tb) return ta < tb ? -1 : 1;
+  return a.key.localeCompare(b.key, "en", { numeric: true });
+}
+
+function toAssignment(candidate: ReadyIssueCandidate, kind: DispatchAssignmentKind): DispatchAssignment {
+  return {
+    key: candidate.key,
+    summary: candidate.summary ?? "",
+    status: candidate.statusName ?? "",
+    kind,
+  };
+}
+
+/**
+ * Picks the ONE item a nudge is about. Order:
+ * 1. tasks in "In Progress", oldest `updated` first;
+ * 2. tasks in "To Do", oldest `created` first;
+ * 3. tasks in any other configured ready status, oldest `created` first;
+ * 4. epics to close (all children done), oldest `created` first;
+ * 5. epics to explode, oldest `created` first.
+ * Ties break on the issue key (numeric-aware). Returns null when nothing is ready.
+ */
+export function selectAssignment(input: {
+  tasks: readonly ReadyIssueCandidate[];
+  epicsToClose: readonly ReadyIssueCandidate[];
+  epicsToExplode: readonly ReadyIssueCandidate[];
+}): DispatchAssignment | null {
+  if (input.tasks.length > 0) {
+    const sorted = [...input.tasks].sort((a, b) => {
+      const rankDiff = taskStatusRank(a.statusName) - taskStatusRank(b.statusName);
+      if (rankDiff !== 0) return rankDiff;
+      return compareByTimeThenKey(a, b, taskStatusRank(a.statusName) === 0 ? "updated" : "created");
+    });
+    return toAssignment(sorted[0]!, "task");
+  }
+  if (input.epicsToClose.length > 0) {
+    const sorted = [...input.epicsToClose].sort((a, b) => compareByTimeThenKey(a, b, "created"));
+    return toAssignment(sorted[0]!, "epic_close");
+  }
+  if (input.epicsToExplode.length > 0) {
+    const sorted = [...input.epicsToExplode].sort((a, b) => compareByTimeThenKey(a, b, "created"));
+    return toAssignment(sorted[0]!, "epic_explode");
+  }
+  return null;
+}
+
+export interface DeclineReassignTarget {
+  accountId: string;
+  email: string;
+}
+
+export type DeclineReassignmentAction =
+  | { action: "reassign"; key: string; toAccountId: string; toEmail: string }
+  | { action: "shadow_would_reassign"; key: string; toAccountId: string; toEmail: string }
+  | { action: "decline_mismatch"; key: string; currentAssigneeAccountId: string | null }
+  | { action: "shadow_decline_mismatch"; key: string; currentAssigneeAccountId: string | null }
+  | { action: "skip_no_target"; key: string }
+  | { action: "skip_invalid_key"; key: string };
+
+/**
+ * What to do about a NEW `outcome=declined` ack, given the declined Jira
+ * issue's current assignee (null = unassigned). Only an issue still assigned
+ * to the supervisor itself is reassigned; anything else is a mismatch and
+ * Jira is left alone. In shadow mode the same verdict is reported with a
+ * `shadow_` prefix and nothing is changed.
+ */
+export function decideDeclineReassignment(input: {
+  key: string;
+  supervisorAccountId: string;
+  currentAssigneeAccountId: string | null;
+  target: DeclineReassignTarget | null;
+  mode: "shadow" | "enforce";
+}): DeclineReassignmentAction {
+  const { key } = input;
+  if (!isJiraIssueKey(key)) return { action: "skip_invalid_key", key };
+  if (!input.target) return { action: "skip_no_target", key };
+  if (input.currentAssigneeAccountId !== input.supervisorAccountId) {
+    return input.mode === "shadow"
+      ? { action: "shadow_decline_mismatch", key, currentAssigneeAccountId: input.currentAssigneeAccountId }
+      : { action: "decline_mismatch", key, currentAssigneeAccountId: input.currentAssigneeAccountId };
+  }
+  return input.mode === "shadow"
+    ? { action: "shadow_would_reassign", key, toAccountId: input.target.accountId, toEmail: input.target.email }
+    : { action: "reassign", key, toAccountId: input.target.accountId, toEmail: input.target.email };
 }
 
 export interface DispatchParams {
@@ -138,6 +312,13 @@ export interface DecideDispatchInput {
    * excuse a later, un-acked nudge.
    */
   lastAckAt: Date | null;
+  /**
+   * Outcome of the ack at `lastAckAt`. A `declined` ack does NOT count as an
+   * ack for the backoff reset: the decline triggers a reassignment, and that
+   * reassignment changing the ready-work counts is what resets backoff.
+   * Omitted/null keeps the pre-v2 behavior (any ack counts).
+   */
+  lastAckOutcome?: DispatchAckOutcome | null;
   now: Date;
   params?: DispatchParams;
   /**
@@ -169,14 +350,17 @@ export function decideDispatch(input: DecideDispatchInput): DecideDispatchResult
   const fingerprint = countsFingerprint(counts);
 
   const ackedSinceLastNudge =
-    lastNudgeAt != null && lastAckAt != null && lastAckAt.getTime() >= lastNudgeAt.getTime();
+    lastNudgeAt != null &&
+    lastAckAt != null &&
+    input.lastAckOutcome !== "declined" &&
+    lastAckAt.getTime() >= lastNudgeAt.getTime();
   const countsUnchangedSinceLastNudge =
     input.previousCountsFingerprint != null && input.previousCountsFingerprint === fingerprint;
 
   // An un-acked nudge whose counts have not moved since it was sent is "stuck".
   // The level rises once per stuck nudge (when the next nudge is sent), never
-  // per poll, so the backoff delays hold at any poll interval. An ack or a
-  // change in the counts resets the level.
+  // per poll, so the backoff delays hold at any poll interval. An ack (other
+  // than a declined one) or a change in the counts resets the level.
   const stuck = lastNudgeAt != null && !ackedSinceLastNudge && countsUnchangedSinceLastNudge;
   let nextBackoffLevel = lastNudgeAt != null && !stuck ? 0 : input.backoffLevel;
 
@@ -194,6 +378,14 @@ export function decideDispatch(input: DecideDispatchInput): DecideDispatchResult
 
   if (governor.state === "RED") {
     return { nudge: false, reason: "governor_red: the fleet governor is RED; holding new nudges", nextBackoffLevel };
+  }
+
+  if (governor.state === "CAPPED") {
+    return {
+      nudge: false,
+      reason: "governor_capped: the weekly cap schedule is holding the fleet; holding new nudges",
+      nextBackoffLevel,
+    };
   }
 
   if (governor.fiveHourPct != null && governor.fiveHourPct >= governor.floor5h) {

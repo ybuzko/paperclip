@@ -13,6 +13,8 @@ const API_TOKEN = "jira-secret-token";
 type StubBehaviour = {
   approximateCount?: (req: IncomingMessage, body: unknown, res: ServerResponse) => void;
   searchJql?: (req: IncomingMessage, url: URL, res: ServerResponse) => void;
+  /** Any other path (issue GET/assignee PUT/comment POST). */
+  other?: (req: IncomingMessage, url: URL, body: unknown, res: ServerResponse) => void;
 };
 
 type StubServer = {
@@ -68,6 +70,7 @@ async function startStub(behaviour: StubBehaviour = {}): Promise<StubServer> {
           nextPageToken: null,
         });
       }
+      if (behaviour.other) return behaviour.other(req, url, parsed, res);
       json(res, 404, { errorMessages: ["not found"] });
     });
   });
@@ -253,6 +256,99 @@ describe("jira-client", () => {
       });
       const client = createJiraClient({ baseUrl: stub.url, email: EMAIL, apiToken: API_TOKEN });
       await expect(client.searchKeys("project = FT")).rejects.toBeInstanceOf(JiraAuthError);
+      await stub.close();
+    });
+  });
+
+  describe("searchIssues", () => {
+    it("requests summary/created/updated by default and maps them", async () => {
+      const stub = await startStub({
+        searchJql: (_req, url, res) => {
+          expect(url.searchParams.get("fields")).toBe("key,summary,status,issuetype,created,updated,parent");
+          json(res, 200, {
+            issues: [
+              {
+                key: "FT-1",
+                fields: {
+                  summary: "Do the thing",
+                  created: "2026-01-01T00:00:00.000+0000",
+                  updated: "2026-01-02T00:00:00.000+0000",
+                  issuetype: { name: "Task" },
+                  status: { name: "In Progress", statusCategory: { key: "indeterminate" } },
+                },
+              },
+            ],
+            isLast: true,
+          });
+        },
+      });
+      const client = createJiraClient({ baseUrl: stub.url, email: EMAIL, apiToken: API_TOKEN });
+      expect(await client.searchIssues("project = FT")).toEqual([
+        {
+          key: "FT-1",
+          summary: "Do the thing",
+          created: "2026-01-01T00:00:00.000+0000",
+          updated: "2026-01-02T00:00:00.000+0000",
+          issueTypeName: "Task",
+          statusName: "In Progress",
+          statusCategoryKey: "indeterminate",
+          parentKey: null,
+        },
+      ]);
+      await stub.close();
+    });
+  });
+
+  describe("issue writes", () => {
+    it("getIssue fetches the requested fields", async () => {
+      const stub = await startStub({
+        other: (req, url, _body, res) => {
+          expect(req.method).toBe("GET");
+          expect(url.pathname).toBe("/rest/api/3/issue/FT-7");
+          expect(url.searchParams.get("fields")).toBe("assignee");
+          json(res, 200, { key: "FT-7", fields: { assignee: { accountId: "acc-1" } } });
+        },
+      });
+      const client = createJiraClient({ baseUrl: stub.url, email: EMAIL, apiToken: API_TOKEN });
+      expect(await client.getIssue("FT-7", ["assignee"])).toEqual({ key: "FT-7", fields: { assignee: { accountId: "acc-1" } } });
+      await stub.close();
+    });
+
+    it("assignIssue PUTs the accountId to the v3 assignee endpoint", async () => {
+      const stub = await startStub({
+        other: (_req, _url, _body, res) => {
+          res.writeHead(204);
+          res.end();
+        },
+      });
+      const client = createJiraClient({ baseUrl: stub.url, email: EMAIL, apiToken: API_TOKEN });
+      await client.assignIssue("FT-7", "human-acc");
+      expect(stub.requests).toEqual([
+        { method: "PUT", path: "/rest/api/3/issue/FT-7/assignee", authorization: expectedAuthHeader(), body: { accountId: "human-acc" } },
+      ]);
+      await stub.close();
+    });
+
+    it("addComment POSTs a plain-text body to the v2 comment endpoint", async () => {
+      const stub = await startStub({
+        other: (_req, _url, _body, res) => json(res, 201, { id: "1" }),
+      });
+      const client = createJiraClient({ baseUrl: stub.url, email: EMAIL, apiToken: API_TOKEN });
+      await client.addComment("FT-7", "Declined by fleet supervisor X");
+      expect(stub.requests[0]).toMatchObject({
+        method: "POST",
+        path: "/rest/api/2/issue/FT-7/comment",
+        body: { body: "Declined by fleet supervisor X" },
+      });
+      await stub.close();
+    });
+
+    it("classifies a 403 on assign as JiraAuthError", async () => {
+      const stub = await startStub({
+        other: (_req, _url, _body, res) => json(res, 403, { errorMessages: ["no permission"] }),
+      });
+      const client = createJiraClient({ baseUrl: stub.url, email: EMAIL, apiToken: API_TOKEN });
+      await expect(client.assignIssue("FT-7", "human-acc")).rejects.toBeInstanceOf(JiraAuthError);
       await stub.close();
     });
   });

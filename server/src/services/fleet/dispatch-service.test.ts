@@ -16,58 +16,112 @@ import {
 } from "@paperclipai/db";
 import {
   createFleetDispatchService,
+  dispatchIssueDescription,
   DISPATCH_MODE_SETTINGS_KEY,
   JIRA_SETTINGS_KEY,
   type FleetDispatchWakeup,
 } from "./dispatch-service.js";
 import type { FleetDispatchLogger } from "./dispatch-service.js";
-import type { JiraClient, JiraClientFactory, JiraIssueSummary } from "./jira-client.js";
+import type { JiraClient, JiraClientFactory, JiraIssueDetail, JiraIssueSummary } from "./jira-client.js";
 
 function fakeLogger(): FleetDispatchLogger {
   return { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() };
 }
 
+interface FakeIssue {
+  key: string;
+  summary?: string;
+  status?: string;
+  created?: string;
+  updated?: string;
+}
+
 interface FakeJiraScript {
-  readyTasks: number;
-  epicsToExplode: number;
+  /** A number generates that many "To Do" tasks FT-1..FT-n. */
+  readyTasks: number | FakeIssue[];
+  epicsToExplode: number | FakeIssue[];
   closeCandidateKeys: string[];
   /** Candidate epic keys that still have an unfinished child (i.e. NOT ready to close). */
   unfinishedParentKeys: string[];
+  /** Current Jira assignee accountId per issue key for getIssue(); default "acc-1" (the supervisor). */
+  assignees?: Record<string, string | null>;
 }
 
-function fakeJiraFactory(script: FakeJiraScript): { factory: JiraClientFactory; calls: string[] } {
+function toIssues(value: number | FakeIssue[], prefix: string, status: string, issueType: string): JiraIssueDetail[] {
+  const list: FakeIssue[] = Array.isArray(value)
+    ? value
+    : Array.from({ length: value }, (_, i) => ({
+        key: `${prefix}-${i + 1}`,
+        created: `2026-01-0${(i % 9) + 1}T00:00:00.000Z`,
+      }));
+  return list.map((issue) => ({
+    key: issue.key,
+    summary: issue.summary ?? `Summary of ${issue.key}`,
+    issueTypeName: issueType,
+    statusName: issue.status ?? status,
+    statusCategoryKey: null,
+    parentKey: null,
+    created: issue.created ?? null,
+    updated: issue.updated ?? null,
+  }));
+}
+
+function fakeJiraFactory(script: FakeJiraScript): {
+  factory: JiraClientFactory;
+  calls: string[];
+  assigns: Array<{ key: string; accountId: string }>;
+  comments: Array<{ key: string; text: string }>;
+  getIssueCalls: string[];
+} {
   const calls: string[] = [];
+  const assigns: Array<{ key: string; accountId: string }> = [];
+  const comments: Array<{ key: string; text: string }> = [];
+  const getIssueCalls: string[] = [];
+  const assignees: Record<string, string | null> = { ...(script.assignees ?? {}) };
+  const searchIssues = async (jql: string): Promise<JiraIssueDetail[]> => {
+    calls.push(jql);
+    if (jql.includes("issuetype != Epic")) return toIssues(script.readyTasks, "FT", "To Do", "Task");
+    if (jql.includes("issuetype = Epic") && jql.includes('status = "To Do"')) {
+      return toIssues(script.epicsToExplode, "FTE", "To Do", "Epic");
+    }
+    if (jql.includes("issuetype = Epic") && jql.includes('status = "In Progress"')) {
+      return toIssues(script.closeCandidateKeys.map((key) => ({ key })), "FTC", "In Progress", "Epic");
+    }
+    if (jql.includes("parent in")) {
+      return script.unfinishedParentKeys.map((parentKey) => ({
+        key: `${parentKey}-CHILD`,
+        summary: null,
+        issueTypeName: "Task",
+        statusName: "In Progress",
+        statusCategoryKey: "indeterminate",
+        parentKey,
+        created: null,
+        updated: null,
+      }));
+    }
+    return [];
+  };
   const client: JiraClient = {
     approximateCount: async (jql: string) => {
       calls.push(jql);
-      if (jql.includes("issuetype != Epic")) return script.readyTasks;
-      if (jql.includes("issuetype = Epic") && jql.includes('status = "To Do"')) return script.epicsToExplode;
       return 0;
     },
-    searchKeys: async (jql: string): Promise<JiraIssueSummary[]> => {
-      calls.push(jql);
-      if (jql.includes("issuetype = Epic") && jql.includes('status = "In Progress"')) {
-        return script.closeCandidateKeys.map((key) => ({
-          key,
-          issueTypeName: "Epic",
-          statusName: "In Progress",
-          statusCategoryKey: "indeterminate",
-          parentKey: null,
-        }));
-      }
-      if (jql.includes("parent in")) {
-        return script.unfinishedParentKeys.map((parentKey) => ({
-          key: `${parentKey}-CHILD`,
-          issueTypeName: "Task",
-          statusName: "In Progress",
-          statusCategoryKey: "indeterminate",
-          parentKey,
-        }));
-      }
-      return [];
+    searchIssues,
+    searchKeys: async (jql: string): Promise<JiraIssueSummary[]> => searchIssues(jql),
+    getIssue: async (key: string) => {
+      getIssueCalls.push(key);
+      const accountId = key in assignees ? assignees[key] : "acc-1";
+      return { key, fields: { assignee: accountId ? { accountId } : null } };
+    },
+    assignIssue: async (key: string, accountId: string) => {
+      assigns.push({ key, accountId });
+      assignees[key] = accountId;
+    },
+    addComment: async (key: string, text: string) => {
+      comments.push({ key, text });
     },
   };
-  return { factory: () => client, calls };
+  return { factory: () => client, calls, assigns, comments, getIssueCalls };
 }
 
 function fakeWakeup(): { fn: FleetDispatchWakeup; calls: Array<{ agentId: string; opts: Parameters<FleetDispatchWakeup>[1] }> } {
@@ -173,10 +227,15 @@ describeEmbeddedPostgres("fleet dispatch service (embedded postgres)", () => {
     return projectId;
   }
 
-  async function seedJiraSettings(): Promise<void> {
+  async function seedJiraSettings(opts: { human?: boolean } = {}): Promise<void> {
     await db.insert(fleetSettings).values({
       key: JIRA_SETTINGS_KEY,
-      value: { baseUrl: "https://example.atlassian.net", email: "bot@example.com", tokenSecretId: "unused-in-tests" },
+      value: {
+        baseUrl: "https://example.atlassian.net",
+        email: "bot@example.com",
+        tokenSecretId: "unused-in-tests",
+        ...(opts.human ? { humanAccountId: "human-acc", humanEmail: "human@example.com" } : {}),
+      },
       version: "v1",
       updatedAt: new Date(),
       updatedBy: "test-admin",
@@ -193,20 +252,21 @@ describeEmbeddedPostgres("fleet dispatch service (embedded postgres)", () => {
     });
   }
 
-  async function seedGreenGovernor(ts: Date): Promise<void> {
+  async function seedGreenGovernor(ts: Date, opts: { state?: string; excludedModels?: string[] } = {}): Promise<void> {
+    const state = opts.state ?? "OPEN";
     await db.insert(fleetThrottleStates).values({
       ts,
       mode: "shadow",
-      state: "GREEN",
+      state,
       stale: false,
-      pace: 0.9,
+      pace: null,
       fiveHourPct: 10,
       sevenDayPct: 40,
       floorActive: false,
-      reason: "GREEN: seeded for dispatch test",
-      paramsVersion: "v0-proposed",
+      reason: `${state}: seeded for dispatch test`,
+      paramsVersion: "v1-cap-schedule",
       inputs: {},
-      launchParameters: {},
+      launchParameters: { excludedModels: opts.excludedModels ?? [], maxConcurrency: 1 },
     });
   }
 
@@ -287,12 +347,18 @@ describeEmbeddedPostgres("fleet dispatch service (embedded postgres)", () => {
     expect(wakeup.calls[0]?.opts.idempotencyKey).toBe(`fleet_dispatch:${projectId}:${NOW.toISOString().slice(0, 16)}`);
     const payload = wakeup.calls[0]?.opts.payload as { issueId: string; fleetDispatch: Record<string, unknown> };
     expect(payload.fleetDispatch).toMatchObject({
+      version: 2,
       jiraProject: "FT",
+      assignment: { key: "FT-1", summary: "Summary of FT-1", status: "To Do", kind: "task" },
       readyTasks: 3,
       epicsToExplode: 1,
       epicsToClose: 0,
-      throttleState: "GREEN",
+      throttleState: "OPEN",
+      modelExclusions: [],
+      ackFormat: "fleet-ack: worked=<KEY> outcome=<done|declined|partial>",
     });
+    // No human configured in jira settings -> no declineReassignTo.
+    expect(payload.fleetDispatch).not.toHaveProperty("declineReassignTo");
 
     const dispatchRows = await db.select().from(fleetDispatchState);
     expect(dispatchRows[0]?.dispatchIssueId).toBe(payload.issueId);
@@ -499,5 +565,437 @@ describeEmbeddedPostgres("fleet dispatch service (embedded postgres)", () => {
     expect(status.jiraConfigured).toBe(true);
     expect(status.params.pollIntervalMs).toBeGreaterThan(0);
     expect(status.states).toHaveLength(1);
+  });
+  describe("fleet dispatch v2", () => {
+    async function seedNudgedState(input: {
+      projectId: string;
+      companyId: string;
+      leadAgentId: string;
+      runId: string;
+      nudgeAt: Date;
+      countsFingerprint?: string;
+      backoffLevel?: number;
+    }): Promise<void> {
+      await db.insert(fleetDispatchState).values({
+        projectId: input.projectId,
+        companyId: input.companyId,
+        jiraProject: "FT",
+        leadAgentId: input.leadAgentId,
+        lastNudgeAt: input.nudgeAt,
+        lastNudgeWakeId: input.runId,
+        countsFingerprint: input.countsFingerprint ?? "1:0:0",
+        backoffLevel: input.backoffLevel ?? 0,
+        updatedAt: input.nudgeAt,
+      });
+    }
+
+    async function seedFinishedRun(input: {
+      runId: string;
+      companyId: string;
+      agentId: string;
+      finishedAt: Date;
+      summary: string;
+    }): Promise<void> {
+      await db.insert(heartbeatRuns).values({
+        id: input.runId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        status: "succeeded",
+        invocationSource: "automation",
+        finishedAt: input.finishedAt,
+        resultJson: { ok: true, summary: input.summary },
+        stdoutExcerpt: `${input.summary}\n`,
+      });
+    }
+
+    it("selects In Progress tasks first (oldest updated), and carries declineReassignTo, modelExclusions and CAPPED", async () => {
+      const companyId = await seedCompany();
+      const leadAgentId = await seedLeadAgent(companyId);
+      await seedProject(companyId, leadAgentId);
+      await seedJiraSettings({ human: true });
+      await seedEnforceMode();
+      await seedGreenGovernor(NOW, { state: "CAPPED", excludedModels: ["Fable"] });
+
+      const jira = fakeJiraFactory({
+        readyTasks: [
+          { key: "FT-1", status: "To Do", created: "2025-01-01T00:00:00.000Z" },
+          { key: "FT-2", status: "In Progress", created: "2026-01-05T00:00:00.000Z", updated: "2026-01-20T00:00:00.000Z" },
+          { key: "FT-3", status: "In Progress", created: "2026-01-06T00:00:00.000Z", updated: "2026-01-10T00:00:00.000Z" },
+        ],
+        epicsToExplode: 1,
+        closeCandidateKeys: ["FT-10"],
+        unfinishedParentKeys: [],
+      });
+      const wakeup = fakeWakeup();
+      const svc = createFleetDispatchService({ db, logger: fakeLogger(), jira: jira.factory, wakeup: wakeup.fn, now: () => NOW });
+
+      const result = await svc.tick();
+
+      expect(result.projects[0]?.nudged).toBe(true);
+      const payload = wakeup.calls[0]?.opts.payload as { fleetDispatch: Record<string, unknown> };
+      expect(payload.fleetDispatch).toMatchObject({
+        version: 2,
+        assignment: { key: "FT-3", status: "In Progress", kind: "task" },
+        declineReassignTo: { accountId: "human-acc", email: "human@example.com" },
+        throttleState: "CAPPED",
+        modelExclusions: ["fable"],
+        readyTasks: 3,
+        epicsToExplode: 1,
+        epicsToClose: 1,
+        epicKeysToClose: ["FT-10"],
+      });
+
+      const rows = await db.select().from(fleetDispatchState);
+      const lastDecision = rows[0]?.lastDecision as { assignment?: { key: string }; nudgedAssignment?: { key: string } };
+      expect(lastDecision.assignment?.key).toBe("FT-3");
+      expect(lastDecision.nudgedAssignment?.key).toBe("FT-3");
+    });
+
+    it("selects an epic to close before an epic to explode when no tasks are ready", async () => {
+      const companyId = await seedCompany();
+      const leadAgentId = await seedLeadAgent(companyId);
+      await seedProject(companyId, leadAgentId);
+      await seedJiraSettings();
+      await seedEnforceMode();
+      await seedGreenGovernor(NOW);
+
+      const jira = fakeJiraFactory({ readyTasks: 0, epicsToExplode: 2, closeCandidateKeys: ["FT-10"], unfinishedParentKeys: [] });
+      const wakeup = fakeWakeup();
+      const svc = createFleetDispatchService({ db, logger: fakeLogger(), jira: jira.factory, wakeup: wakeup.fn, now: () => NOW });
+
+      await svc.tick();
+
+      const payload = wakeup.calls[0]?.opts.payload as { fleetDispatch: { assignment: { key: string; kind: string } } };
+      expect(payload.fleetDispatch.assignment).toMatchObject({ key: "FT-10", kind: "epic_close" });
+    });
+
+    it("reads a v2 ack from the finished nudge run's result and resets backoff", async () => {
+      const companyId = await seedCompany();
+      const leadAgentId = await seedLeadAgent(companyId);
+      const projectId = await seedProject(companyId, leadAgentId);
+      await seedJiraSettings({ human: true });
+      await seedEnforceMode();
+      const runId = randomUUID();
+      await seedNudgedState({ projectId, companyId, leadAgentId, runId, nudgeAt: NOW, backoffLevel: 1 });
+      await seedFinishedRun({
+        runId,
+        companyId,
+        agentId: leadAgentId,
+        finishedAt: new Date(NOW.getTime() + 60_000),
+        summary: "Pushed the fix.\nfleet-ack: worked=FT-1 outcome=done",
+      });
+
+      const now = new Date(NOW.getTime() + 16 * 60 * 1000);
+      await seedGreenGovernor(now);
+      const jira = fakeJiraFactory({ readyTasks: 1, epicsToExplode: 0, closeCandidateKeys: [], unfinishedParentKeys: [] });
+      const wakeup = fakeWakeup();
+      const svc = createFleetDispatchService({ db, logger: fakeLogger(), jira: jira.factory, wakeup: wakeup.fn, now: () => now });
+
+      const result = await svc.tick();
+
+      expect(result.projects[0]?.nudged).toBe(true);
+      const rows = await db.select().from(fleetDispatchState);
+      expect(rows[0]?.backoffLevel).toBe(0);
+      expect(rows[0]?.lastAck).toMatchObject({ id: `run:${runId}`, source: "run_result", worked: "FT-1", kind: null, outcome: "done" });
+      expect(jira.assigns).toHaveLength(0);
+    });
+
+    it("a finished nudge run without an ack counts as un-acked (backoff holds)", async () => {
+      const companyId = await seedCompany();
+      const leadAgentId = await seedLeadAgent(companyId);
+      const projectId = await seedProject(companyId, leadAgentId);
+      await seedJiraSettings();
+      await seedEnforceMode();
+      const runId = randomUUID();
+      await seedNudgedState({ projectId, companyId, leadAgentId, runId, nudgeAt: NOW });
+      await seedFinishedRun({ runId, companyId, agentId: leadAgentId, finishedAt: new Date(NOW.getTime() + 60_000), summary: "Looked around." });
+
+      const now = new Date(NOW.getTime() + 16 * 60 * 1000);
+      await seedGreenGovernor(now);
+      const jira = fakeJiraFactory({ readyTasks: 1, epicsToExplode: 0, closeCandidateKeys: [], unfinishedParentKeys: [] });
+      const wakeup = fakeWakeup();
+      const svc = createFleetDispatchService({ db, logger: fakeLogger(), jira: jira.factory, wakeup: wakeup.fn, now: () => now });
+
+      const result = await svc.tick();
+
+      expect(wakeup.calls).toHaveLength(0);
+      expect(result.projects[0]?.decision?.reason).toContain("backoff");
+    });
+
+    it("reassigns a declined issue to the human once, comments, and does not let the decline reset backoff", async () => {
+      const companyId = await seedCompany();
+      const leadAgentId = await seedLeadAgent(companyId);
+      const projectId = await seedProject(companyId, leadAgentId);
+      await seedJiraSettings({ human: true });
+      await seedEnforceMode();
+      const runId = randomUUID();
+      await seedNudgedState({ projectId, companyId, leadAgentId, runId, nudgeAt: NOW, countsFingerprint: "2:0:0", backoffLevel: 1 });
+      const reply = `Blocked on credentials I do not have. ${"x".repeat(600)}\nfleet-ack: worked=FT-1 outcome=declined`;
+      await seedFinishedRun({ runId, companyId, agentId: leadAgentId, finishedAt: new Date("2026-02-01T12:01:00.000Z"), summary: reply });
+
+      const now = new Date(NOW.getTime() + 16 * 60 * 1000);
+      await seedGreenGovernor(now);
+      const jira = fakeJiraFactory({ readyTasks: 2, epicsToExplode: 0, closeCandidateKeys: [], unfinishedParentKeys: [] });
+      const wakeup = fakeWakeup();
+      let clock = now;
+      const svc = createFleetDispatchService({ db, logger: fakeLogger(), jira: jira.factory, wakeup: wakeup.fn, now: () => clock });
+
+      const first = await svc.tick();
+
+      expect(jira.assigns).toEqual([{ key: "FT-1", accountId: "human-acc" }]);
+      expect(jira.comments).toHaveLength(1);
+      expect(jira.comments[0]?.key).toBe("FT-1");
+      expect(jira.comments[0]?.text).toBe(
+        `Declined by fleet supervisor Supervisor at Feb 1, 2026, 4:01 AM PST; reassigned to human@example.com for investigation. Agent reply: ${reply.slice(0, 500)}`,
+      );
+      // The reassigned key is excluded from this tick's selection and counts,
+      // so the counts moved (2 -> 1) and the next nudge is about FT-2.
+      expect(first.projects[0]?.counts?.readyTasks).toBe(1);
+      expect(first.projects[0]?.nudged).toBe(true);
+      const payload = wakeup.calls[0]?.opts.payload as { fleetDispatch: { assignment: { key: string } } };
+      expect(payload.fleetDispatch.assignment.key).toBe("FT-2");
+
+      const rows = await db.select().from(fleetDispatchState);
+      expect(rows[0]?.lastAck).toMatchObject({
+        id: `run:${runId}`,
+        outcome: "declined",
+        decline: { action: "reassigned", key: "FT-1", toEmail: "human@example.com" },
+      });
+
+      // Idempotent: the same ack seen again (restart with the same state) is not re-processed.
+      await db.update(fleetDispatchState).set({ lastNudgeWakeId: runId });
+      clock = new Date(now.getTime() + 20 * 60 * 1000);
+      await seedGreenGovernor(clock);
+      const svc2 = createFleetDispatchService({ db, logger: fakeLogger(), jira: jira.factory, wakeup: wakeup.fn, now: () => clock });
+      await svc2.tick();
+      expect(jira.getIssueCalls).toEqual(["FT-1"]);
+      expect(jira.assigns).toHaveLength(1);
+      expect(jira.comments).toHaveLength(1);
+    });
+
+    it("records decline_mismatch and leaves Jira alone when the declined issue is assigned to someone else", async () => {
+      const companyId = await seedCompany();
+      const leadAgentId = await seedLeadAgent(companyId);
+      const projectId = await seedProject(companyId, leadAgentId);
+      await seedJiraSettings({ human: true });
+      await seedEnforceMode();
+      const runId = randomUUID();
+      await seedNudgedState({ projectId, companyId, leadAgentId, runId, nudgeAt: NOW });
+      await seedFinishedRun({
+        runId,
+        companyId,
+        agentId: leadAgentId,
+        finishedAt: new Date(NOW.getTime() + 60_000),
+        summary: "fleet-ack: worked=FT-1 kind=task outcome=declined",
+      });
+
+      const now = new Date(NOW.getTime() + 16 * 60 * 1000);
+      await seedGreenGovernor(now);
+      const jira = fakeJiraFactory({
+        readyTasks: 1,
+        epicsToExplode: 0,
+        closeCandidateKeys: [],
+        unfinishedParentKeys: [],
+        assignees: { "FT-1": "someone-else" },
+      });
+      const wakeup = fakeWakeup();
+      const svc = createFleetDispatchService({ db, logger: fakeLogger(), jira: jira.factory, wakeup: wakeup.fn, now: () => now });
+
+      const result = await svc.tick();
+
+      expect(jira.getIssueCalls).toEqual(["FT-1"]);
+      expect(jira.assigns).toHaveLength(0);
+      expect(jira.comments).toHaveLength(0);
+      const rows = await db.select().from(fleetDispatchState);
+      expect(rows[0]?.lastAck).toMatchObject({
+        kind: "task",
+        outcome: "declined",
+        decline: { action: "decline_mismatch", currentAssigneeAccountId: "someone-else" },
+      });
+      // Declined and counts unchanged: the decline does not reset backoff, so
+      // the stuck nudge is held for the backoff delay.
+      expect(result.projects[0]?.nudged).toBe(false);
+      expect(result.projects[0]?.decision?.reason).toContain("backoff");
+    });
+
+    it("shadow mode only logs what it would do with a declined ack", async () => {
+      const companyId = await seedCompany();
+      const leadAgentId = await seedLeadAgent(companyId);
+      const projectId = await seedProject(companyId, leadAgentId);
+      await seedJiraSettings({ human: true });
+      const runId = randomUUID();
+      await seedNudgedState({ projectId, companyId, leadAgentId, runId, nudgeAt: NOW });
+      await seedFinishedRun({
+        runId,
+        companyId,
+        agentId: leadAgentId,
+        finishedAt: new Date(NOW.getTime() + 60_000),
+        summary: "fleet-ack: worked=FT-1 outcome=declined",
+      });
+
+      const now = new Date(NOW.getTime() + 16 * 60 * 1000);
+      await seedGreenGovernor(now);
+      const jira = fakeJiraFactory({ readyTasks: 1, epicsToExplode: 0, closeCandidateKeys: [], unfinishedParentKeys: [] });
+      const wakeup = fakeWakeup();
+      const svc = createFleetDispatchService({ db, logger: fakeLogger(), jira: jira.factory, wakeup: wakeup.fn, now: () => now });
+
+      await svc.tick();
+
+      expect(jira.assigns).toHaveLength(0);
+      expect(jira.comments).toHaveLength(0);
+      expect(wakeup.calls).toHaveLength(0);
+      const rows = await db.select().from(fleetDispatchState);
+      expect(rows[0]?.lastAck).toMatchObject({ decline: { action: "shadow_would_reassign", toEmail: "human@example.com" } });
+    });
+
+    it("skips reassignment with a warning when no human is configured", async () => {
+      const companyId = await seedCompany();
+      const leadAgentId = await seedLeadAgent(companyId);
+      const projectId = await seedProject(companyId, leadAgentId);
+      await seedJiraSettings();
+      await seedEnforceMode();
+      const runId = randomUUID();
+      await seedNudgedState({ projectId, companyId, leadAgentId, runId, nudgeAt: NOW });
+      await seedFinishedRun({
+        runId,
+        companyId,
+        agentId: leadAgentId,
+        finishedAt: new Date(NOW.getTime() + 60_000),
+        summary: "fleet-ack: worked=FT-1 outcome=declined",
+      });
+
+      const now = new Date(NOW.getTime() + 16 * 60 * 1000);
+      await seedGreenGovernor(now);
+      const jira = fakeJiraFactory({ readyTasks: 1, epicsToExplode: 0, closeCandidateKeys: [], unfinishedParentKeys: [] });
+      const logger = fakeLogger();
+      const svc = createFleetDispatchService({ db, logger, jira: jira.factory, wakeup: fakeWakeup().fn, now: () => now });
+
+      await svc.tick();
+
+      expect(jira.getIssueCalls).toHaveLength(0);
+      expect(jira.assigns).toHaveLength(0);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ key: "FT-1" }),
+        expect.stringContaining("humanAccountId/humanEmail are not configured"),
+      );
+      const rows = await db.select().from(fleetDispatchState);
+      expect(rows[0]?.lastAck).toMatchObject({ decline: { action: "skip_no_target" } });
+    });
+
+    it("wakes the supervisor for its oldest pending Paperclip issue instead of a Jira nudge", async () => {
+      const companyId = await seedCompany();
+      const leadAgentId = await seedLeadAgent(companyId);
+      const projectId = await seedProject(companyId, leadAgentId);
+      await seedJiraSettings();
+      await seedEnforceMode();
+      await seedGreenGovernor(NOW);
+      const olderId = randomUUID();
+      await db.insert(issues).values([
+        {
+          id: randomUUID(),
+          companyId,
+          title: "newer",
+          status: "in_progress",
+          assigneeAgentId: leadAgentId,
+          identifier: "PIX-9",
+          createdAt: new Date("2026-01-20T00:00:00.000Z"),
+        },
+        {
+          id: olderId,
+          companyId,
+          title: "older",
+          status: "todo",
+          assigneeAgentId: leadAgentId,
+          identifier: "PIX-7",
+          createdAt: new Date("2026-01-10T00:00:00.000Z"),
+        },
+        {
+          id: randomUUID(),
+          companyId,
+          title: "Fleet dispatch: FT",
+          status: "in_progress",
+          assigneeAgentId: leadAgentId,
+          identifier: "PIX-1",
+          originKind: "fleet_dispatch",
+          createdAt: new Date("2025-01-01T00:00:00.000Z"),
+        },
+        {
+          id: randomUUID(),
+          companyId,
+          title: "done one",
+          status: "done",
+          assigneeAgentId: leadAgentId,
+          identifier: "PIX-2",
+          createdAt: new Date("2025-06-01T00:00:00.000Z"),
+        },
+      ]);
+
+      const jira = fakeJiraFactory({ readyTasks: 2, epicsToExplode: 0, closeCandidateKeys: [], unfinishedParentKeys: [] });
+      const wakeup = fakeWakeup();
+      const svc = createFleetDispatchService({ db, logger: fakeLogger(), jira: jira.factory, wakeup: wakeup.fn, now: () => NOW });
+
+      const result = await svc.tick();
+
+      expect(wakeup.calls).toHaveLength(1);
+      expect(wakeup.calls[0]?.opts.reason).toBe("fleet_pending_issue");
+      expect(wakeup.calls[0]?.opts.payload).toMatchObject({ issueId: olderId });
+      expect(wakeup.calls[0]?.opts.contextSnapshot).toMatchObject({ issueId: olderId });
+      expect(wakeup.calls[0]?.opts.contextSnapshot).not.toHaveProperty("fleetDispatch");
+      expect(result.projects[0]?.decision?.reason).toBe("paperclip_issue_priority: PIX-7");
+
+      const rows = await db.select().from(fleetDispatchState);
+      expect(rows[0]?.projectId).toBe(projectId);
+      expect(rows[0]?.lastNudgeAt).toBeNull();
+      expect(rows[0]?.lastDecision).toMatchObject({
+        reason: "paperclip_issue_priority: PIX-7",
+        pendingIssueWake: { issueId: olderId, identifier: "PIX-7" },
+      });
+
+      // Within the min nudge gap of that wake: no second wake of either kind.
+      const later = new Date(NOW.getTime() + 5 * 60 * 1000);
+      const svc2 = createFleetDispatchService({ db, logger: fakeLogger(), jira: jira.factory, wakeup: wakeup.fn, now: () => later });
+      const second = await svc2.tick();
+      expect(wakeup.calls).toHaveLength(1);
+      expect(second.projects[0]?.decision?.reason).toContain("paperclip_issue_priority: PIX-7 (held: min_nudge_gap");
+    });
+
+    it("a pending Paperclip issue respects agent_busy and still suppresses the Jira nudge", async () => {
+      const companyId = await seedCompany();
+      const leadAgentId = await seedLeadAgent(companyId);
+      await seedProject(companyId, leadAgentId);
+      await seedJiraSettings();
+      await seedEnforceMode();
+      await seedGreenGovernor(NOW);
+      await db.insert(issues).values({
+        companyId,
+        title: "pending",
+        status: "todo",
+        assigneeAgentId: leadAgentId,
+        identifier: "PIX-3",
+      });
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: leadAgentId,
+        status: "running",
+        invocationSource: "on_demand",
+      });
+
+      const jira = fakeJiraFactory({ readyTasks: 1, epicsToExplode: 0, closeCandidateKeys: [], unfinishedParentKeys: [] });
+      const wakeup = fakeWakeup();
+      const svc = createFleetDispatchService({ db, logger: fakeLogger(), jira: jira.factory, wakeup: wakeup.fn, now: () => NOW });
+
+      const result = await svc.tick();
+
+      expect(wakeup.calls).toHaveLength(0);
+      expect(result.projects[0]?.decision?.reason).toContain("paperclip_issue_priority: PIX-3 (held: agent_busy");
+    });
+
+    it("the standing dispatch issue description documents the v2 ack and rules", () => {
+      const text = dispatchIssueDescription("FT");
+      expect(text).toContain("fleet-ack: worked=<KEY> outcome=<done|declined|partial>");
+      expect(text).toContain("reassigns the Jira issue to the configured human");
+      expect(text).toContain("Paperclip issues assigned to you take priority");
+    });
   });
 });
