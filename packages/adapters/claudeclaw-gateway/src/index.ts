@@ -45,12 +45,20 @@ Runtime mapping:
   transient. An adapter-side timeout (timeoutSec > 0) ends the run without a retry family: the daemon is
   still running the turn and a retry would inject a duplicate wake. timeoutSec 0 (default) waits.
 - claudeclaw reports no token usage on inject, so runs carry no usage numbers.
-- A wake with wakeReason "fleet_dispatch" gets a "Fleet dispatch" prose block inserted between the
-  Project: context prefix and the structured wake prompt, when fleet dispatch data is present on the
-  execution context (see readFleetDispatch in server/execute.ts). It states the governor's throttle
-  state, 5h/7-day budget usage, ready task and epic counts, and a fixed one-item-per-turn instruction
-  ending in an exact ack line. Never includes the API token or key file contents; omitted when no data
-  is present.
+- A wake with wakeReason "fleet_dispatch" carrying a valid version-2 fleet dispatch payload with an
+  assignment (see readFleetDispatch in server/execute.ts) is sent as a short message and nothing else (no
+  context prefix, env block, HTTP procedure or structured wake payload): one line naming the Jira item and
+  what to do with it (work a task, break down an epic, or close an epic), one line saying to reassign it in
+  Jira to the declineReassignTo person with a comment when it cannot be advanced, an optional "Budget is
+  tight" line when the governor is CAPPED or excludes models ("Do not use: <models>."), and a final line
+  asking the reply to end with "fleet-ack: worked=<KEY> outcome=done|declined|partial". The reply text
+  becomes the run summary, where the server reads the ack.
+- Fallback: when the payload is missing or invalid, is not version 2, or has no assignment, the generic
+  wake is sent (and one stderr log line says why). When the payload itself is valid (a v1 payload, or v2
+  with no assignment), a "Fleet dispatch" prose block (throttle state, 5h/7-day budget usage, ready task and epic counts, a fixed
+  one-item-per-turn instruction and the ack line) is inserted between the Project: context prefix and the
+  structured wake prompt. Throttle states OPEN, CAPPED, RED, STALE and legacy GREEN, AMBER, ACCELERATE
+  are accepted. Neither form includes the API token or key file contents.
 
 Connection test:
 - GET {url}/api/health (unauthenticated), then POST {url}/api/inject with the bearer token and an empty
