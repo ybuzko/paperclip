@@ -124,6 +124,17 @@ import {
   agentConfigurationDoc as openclawGatewayAgentConfigurationDoc,
   models as openclawGatewayModels,
 } from "@paperclipai/adapter-openclaw-gateway";
+import {
+  execute as claudeclawGatewayExecute,
+  testEnvironment as claudeclawGatewayTestEnvironment,
+  getConfigSchema as getClaudeclawGatewayConfigSchema,
+  sessionCodec as claudeclawGatewaySessionCodec,
+  sessionManagement as claudeclawGatewaySessionManagement,
+} from "@paperclipai/adapter-claudeclaw-gateway/server";
+import {
+  agentConfigurationDoc as claudeclawGatewayAgentConfigurationDoc,
+  models as claudeclawGatewayModels,
+} from "@paperclipai/adapter-claudeclaw-gateway";
 import { listCodexModels, refreshCodexModels } from "./codex-models.js";
 import { listCursorModels } from "./cursor-models.js";
 import {
@@ -509,6 +520,20 @@ const openclawGatewayAdapter: ServerAdapterModule = {
   agentConfigurationDoc: openclawGatewayAgentConfigurationDoc,
 };
 
+const claudeclawGatewayAdapter: ServerAdapterModule = {
+  type: "claudeclaw_gateway",
+  execute: claudeclawGatewayExecute,
+  testEnvironment: claudeclawGatewayTestEnvironment,
+  sessionCodec: claudeclawGatewaySessionCodec,
+  sessionManagement: claudeclawGatewaySessionManagement,
+  models: claudeclawGatewayModels,
+  supportsLocalAgentJwt: false,
+  supportsInstructionsBundle: false,
+  requiresMaterializedRuntimeSkills: false,
+  agentConfigurationDoc: claudeclawGatewayAgentConfigurationDoc,
+  getConfigSchema: getClaudeclawGatewayConfigSchema,
+};
+
 const openCodeLocalAdapter: ServerAdapterModule = {
   type: "opencode_local",
   execute: openCodeExecute,
@@ -575,6 +600,7 @@ function registerBuiltInAdapters() {
     hermesGatewayAdapter,
     hermesLocalAdapter,
     openclawGatewayAdapter,
+    claudeclawGatewayAdapter,
     processAdapter,
     httpAdapter,
   ]) {

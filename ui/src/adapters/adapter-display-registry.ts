@@ -101,6 +101,12 @@ const adapterDisplayMap: Record<string, AdapterDisplayInfo> = {
     description: "Kimi Code CLI harness",
     icon: Moon,
   },
+  claudeclaw_gateway: {
+    label: "Claudeclaw Gateway",
+    description: "Remote claudeclaw daemon (claude -p) over HTTP",
+    icon: Bot,
+    hideFromVisualSelection: true,
+  },
   hermes_gateway: {
     label: "Hermes Gateway",
     description: "Remote Hermes API server",

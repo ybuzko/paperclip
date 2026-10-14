@@ -62,7 +62,10 @@ export function isIdempotentFinishSuccessfulRunHandoffWakeStatus(status: string)
  * plugin-managed issues to the plugin's own recovery/enforcement path instead.
  */
 export function isPluginManagedIssueLifecycle(issue: { originKind?: string | null }) {
-  return Boolean(issue.originKind?.startsWith("plugin:"));
+  // Plugins own the lifecycle of the issues they create, and so does the fleet dispatch
+  // loop for its standing per-project issue: it stays in_progress by design and the loop,
+  // not a corrective wake, decides the next action.
+  return Boolean(issue.originKind?.startsWith("plugin:")) || issue.originKind === "fleet_dispatch";
 }
 
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
@@ -344,6 +347,19 @@ function isIssueMonitorMaintenanceRun(run: HeartbeatRunRow) {
   return Boolean(wakeReason?.startsWith("issue_monitor") || source?.startsWith("issue.monitor"));
 }
 
+// A fleet dispatch nudge (see services/fleet/dispatch-service.ts) is a turn on a
+// standing per-project issue that is meant to stay in_progress forever: the loop
+// re-polls Jira and wakes the supervisor again when there is more work, so the
+// issue never needs a disposition. Without this skip every nudge would be followed
+// by a corrective handoff wake (a wasted supervisor turn) and then the stranded-
+// issue escalation would mark the standing issue blocked.
+export const FLEET_DISPATCH_WAKE_REASON = "fleet_dispatch";
+
+function isFleetDispatchRun(run: HeartbeatRunRow) {
+  const context = readRecord(run.contextSnapshot);
+  return readString(context.wakeReason) === FLEET_DISPATCH_WAKE_REASON;
+}
+
 function isCommentDrivenWake(run: HeartbeatRunRow) {
   const context = readRecord(run.contextSnapshot);
   const wakeReason = readString(context.wakeReason);
@@ -459,6 +475,7 @@ export function decideSuccessfulRunHandoff(input: {
   if (isRecoveryActionDrivenRun(run)) return { kind: "skip", reason: "recovery action run owns its own follow-up path" };
   if (isIssueMonitorMaintenanceRun(run)) return { kind: "skip", reason: "issue monitor run owns its own recovery path" };
   if (isCommentDrivenWake(run)) return { kind: "skip", reason: "comment-driven wake already owns the next action" };
+  if (isFleetDispatchRun(run)) return { kind: "skip", reason: "fleet dispatch loop owns the next action" };
   if (run.issueCommentStatus === "retry_queued" || run.issueCommentStatus === "retry_exhausted") {
     return { kind: "skip", reason: "missing issue comment retry owns the next action" };
   }
@@ -474,7 +491,7 @@ export function decideSuccessfulRunHandoff(input: {
   if (issue.status !== "in_progress") return { kind: "skip", reason: `issue status ${issue.status} is a valid disposition` };
   if (issue.executionState) return { kind: "skip", reason: "issue has execution policy state" };
   if (isPluginManagedIssueLifecycle(issue)) {
-    return { kind: "skip", reason: "issue lifecycle is owned by a plugin" };
+    return { kind: "skip", reason: issue.originKind === "fleet_dispatch" ? "fleet dispatch loop owns the standing issue" : "issue lifecycle is owned by a plugin" };
   }
   if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
     return { kind: "skip", reason: `agent status ${agent.status} is not invokable` };

@@ -258,7 +258,9 @@ export function describeIssueWriteDenial(
         whoCanAct: `${actor}, once the request carries its own run id.`,
         sanctionedPath:
           `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
-          `and retry.`,
+          `and retry. If this agent legitimately writes from outside Paperclip-triggered runs, ` +
+          `an operator can set \`PAPERCLIP_AGENT_ISSUE_WRITE_RUN_CONTEXT=optional\` on the server ` +
+          `to allow audited, uncounted writes without a run.`,
 
       };
 

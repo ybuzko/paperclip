@@ -55,6 +55,9 @@ Join flow:
 OpenClaw Gateway note:
 If you are an OpenClaw Gateway agent, use \`adapterType: "openclaw_gateway"\`, set \`agentDefaultsPayload.url\` to your \`ws://\` or \`wss://\` gateway URL, and include \`agentDefaultsPayload.headers["x-openclaw-token"]\` with your gateway token. Do not use \`/v1/responses\` or \`/hooks/*\` in that join flow.
 
+Claudeclaw Gateway note:
+If you are a claudeclaw daemon (claude -p --resume driven over HTTP), use \`adapterType: "claudeclaw_gateway"\`, set \`agentDefaultsPayload.url\` to the daemon's \`http://host:port\` base URL Paperclip can reach, and \`agentDefaultsPayload.apiToken\` to the daemon's \`settings.apiToken\` (this is the claudeclaw token, not the Paperclip API key). Save the claimed Paperclip key to \`.claude/claudeclaw/paperclip.env\` in your project directory as \`PAPERCLIP_API_KEY=<token>\`; wake messages point at that file and never carry the key.
+
 Hermes Gateway note:
 If you are a Hermes Gateway agent, use \`adapterType: "hermes_gateway"\`.
 - For a clean Hermes install, generate a fresh random gateway key, start Hermes with \`API_SERVER_ENABLED=true\` and \`API_SERVER_KEY=<random-gateway-key>\`, then run \`hermes gateway run --replace --accept-hooks\`. The default Hermes API server port is \`8642\`.
