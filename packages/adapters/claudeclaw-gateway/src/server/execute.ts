@@ -250,10 +250,40 @@ export function resolveThreadBinding(ctx: AdapterExecutionContext): ThreadResolu
   };
 }
 
-export type FleetThrottleState = "GREEN" | "AMBER" | "RED" | "ACCELERATE";
+/**
+ * Governor throttle states. OPEN | CAPPED | RED | STALE are what the governor emits since
+ * 2026-09-27; GREEN | AMBER | ACCELERATE are the legacy names, still accepted.
+ */
+export type FleetThrottleState = "OPEN" | "CAPPED" | "RED" | "STALE" | "GREEN" | "AMBER" | "ACCELERATE";
+
+export type FleetAssignmentKind = "task" | "epic_explode" | "epic_close";
+
+/** v2: the one Jira item a fleet_dispatch nudge is about. */
+export type FleetAssignment = {
+  key: string;
+  /** null when the payload carries no summary text. */
+  summary: string | null;
+  /** null when the payload carries no status name. */
+  status: string | null;
+  kind: FleetAssignmentKind;
+};
+
+/** v2: who a supervisor reassigns an item to when it cannot advance it. */
+export type FleetDeclineReassignTo = {
+  accountId: string | null;
+  email: string | null;
+};
 
 export type FleetDispatch = {
+  /** Payload version; null for v1 payloads, which carry no version field. */
+  version: number | null;
   jiraProject: string;
+  /** v2: null when absent, malformed, or explicitly null (nothing ready). */
+  assignment: FleetAssignment | null;
+  /** v2: null when absent or carrying neither accountId nor email. */
+  declineReassignTo: FleetDeclineReassignTo | null;
+  /** v2: model names the governor excludes; [] when absent. */
+  modelExclusions: string[];
   readyTasks: number;
   epicsToExplode: number;
   epicsToClose: number;
@@ -267,7 +297,40 @@ export type FleetDispatch = {
   ackFormat: string;
 };
 
-const FLEET_THROTTLE_STATES: ReadonlySet<string> = new Set(["GREEN", "AMBER", "RED", "ACCELERATE"]);
+const FLEET_THROTTLE_STATES: ReadonlySet<string> = new Set([
+  "OPEN",
+  "CAPPED",
+  "RED",
+  "STALE",
+  "GREEN",
+  "AMBER",
+  "ACCELERATE",
+]);
+
+const FLEET_ASSIGNMENT_KINDS: ReadonlySet<string> = new Set(["task", "epic_explode", "epic_close"]);
+
+function validateFleetAssignment(value: unknown): FleetAssignment | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  const key = nonEmpty(record.key);
+  const kind = nonEmpty(record.kind);
+  if (!key || !kind || !FLEET_ASSIGNMENT_KINDS.has(kind)) return null;
+  return {
+    key,
+    summary: nonEmpty(record.summary),
+    status: nonEmpty(record.status),
+    kind: kind as FleetAssignmentKind,
+  };
+}
+
+function validateFleetDeclineReassignTo(value: unknown): FleetDeclineReassignTo | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  const accountId = nonEmpty(record.accountId);
+  const email = nonEmpty(record.email);
+  if (!accountId && !email) return null;
+  return { accountId, email };
+}
 
 function validateFleetDispatch(value: unknown): FleetDispatch | null {
   const record = asRecord(value);
@@ -297,8 +360,22 @@ function validateFleetDispatch(value: unknown): FleetDispatch | null {
         .slice(0, 20)
     : [];
 
+  // v2 fields: all optional so a v1 payload still validates.
+  const version = isFiniteNumber(record.version) ? record.version : null;
+  const assignment = validateFleetAssignment(record.assignment);
+  const declineReassignTo = validateFleetDeclineReassignTo(record.declineReassignTo);
+  const modelExclusions = Array.isArray(record.modelExclusions)
+    ? record.modelExclusions
+        .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+        .map((entry) => entry.trim())
+    : [];
+
   return {
+    version,
     jiraProject,
+    assignment,
+    declineReassignTo,
+    modelExclusions,
     readyTasks,
     epicsToExplode,
     epicsToClose,
@@ -369,11 +446,68 @@ export function buildFleetDispatchBlock(dispatch: FleetDispatch): string {
     `Jira ${dispatch.jiraProject} currently has assigned to you: ${readyTasks} ready tasks (To Do / In Progress), ${epicsToExplode} epics in To Do to review and break down, ${epicsToClose} epics in In Progress whose children are all complete${closeKeysSuffix}.`,
     "Pick ONE item and work it to completion in this turn: a task → work it including your usual evaluation; an epic in To Do → review it, break it into tasks assigned to yourself, then move the epic to In Progress; an epic to close → review the outcome and close it (or reopen work).",
     "Your queue holds only items you can advance. If an item cannot be worked, or your part is done and what remains needs the human (verification, a deploy, access, a decision), reassign it to the human with a comment stating what is waiting on them. Never keep a ticket that is waiting on the human. Do not start a second item.",
-    ...(dispatch.throttleState === "AMBER" ? ["Budget is tight: prefer the smallest ready item."] : []),
+    ...(dispatch.throttleState === "AMBER" || dispatch.throttleState === "CAPPED"
+      ? ["Budget is tight: prefer the smallest ready item."]
+      : []),
     `End this turn by posting exactly one comment on this dispatch issue that contains the line: ${dispatch.ackFormat}.`,
   ];
 
   return sentences.join(" ");
+}
+
+/**
+ * Renders the v2 short fleet_dispatch message (fleet dispatch v2 contract): three lines, plus a
+ * budget line before the ack line when the governor is CAPPED or excludes a model. This is the
+ * whole wake: no context prefix, env block, HTTP procedure or structured wake payload.
+ * Exported for tests.
+ */
+export function buildShortFleetDispatchMessage(dispatch: FleetDispatch, assignment: FleetAssignment): string {
+  const details = [assignment.status, assignment.summary ? `"${assignment.summary}"` : null].filter(
+    (part): part is string => part !== null,
+  );
+  const quotedSummary = assignment.summary ? ` ("${assignment.summary}")` : "";
+  const prefix = `Fleet dispatch, Jira ${dispatch.jiraProject}:`;
+
+  let first: string;
+  switch (assignment.kind) {
+    case "epic_explode":
+      first = `${prefix} break epic ${assignment.key}${quotedSummary} into tasks assigned to yourself, then move the epic to In Progress.`;
+      break;
+    case "epic_close":
+      first = `${prefix} epic ${assignment.key}${quotedSummary} has all children complete; review the outcome and close it, or reopen work.`;
+      break;
+    default:
+      first = `${prefix} work ${assignment.key}${details.length > 0 ? ` (${details.join(", ")})` : ""}.`;
+  }
+
+  const reassignTo = dispatch.declineReassignTo?.email ?? dispatch.declineReassignTo?.accountId ?? "the human";
+  const lines = [first, `If you cannot advance it, reassign it in Jira to ${reassignTo} with a comment saying why.`];
+
+  if (dispatch.throttleState === "CAPPED" || dispatch.modelExclusions.length > 0) {
+    const exclusions =
+      dispatch.modelExclusions.length > 0 ? ` Do not use: ${dispatch.modelExclusions.join(", ")}.` : "";
+    lines.push(`Budget is tight: keep this turn small.${exclusions}`);
+  }
+
+  lines.push(`End your reply with one line: fleet-ack: worked=${assignment.key} outcome=done|declined|partial`);
+  return lines.join("\n");
+}
+
+/**
+ * For a fleet_dispatch wake, decides between the v2 short message and the generic wake.
+ * Returns null for any other wakeReason. Exported for tests.
+ */
+export function resolveFleetDispatchWake(
+  ctx: AdapterExecutionContext,
+): { kind: "short"; message: string } | { kind: "fallback"; dispatch: FleetDispatch | null; reason: string } | null {
+  if (nonEmpty(ctx.context.wakeReason) !== "fleet_dispatch") return null;
+  const dispatch = readFleetDispatch(ctx);
+  if (!dispatch) return { kind: "fallback", dispatch: null, reason: "fleet dispatch payload missing or invalid" };
+  if (dispatch.version !== 2) {
+    return { kind: "fallback", dispatch, reason: `fleet dispatch payload version ${dispatch.version ?? "none"} is not 2` };
+  }
+  if (!dispatch.assignment) return { kind: "fallback", dispatch, reason: "fleet dispatch payload has no assignment" };
+  return { kind: "short", message: buildShortFleetDispatchMessage(dispatch, dispatch.assignment) };
 }
 
 /** First line of the wake: the turn states its own project/thread/workspace context. */
@@ -531,6 +665,9 @@ function joinWakePayloadSections(structuredWakePrompt: string, structuredWakeJso
 }
 
 export function buildWakeMessage(ctx: AdapterExecutionContext, binding?: ThreadBinding | null): string {
+  const fleetWake = resolveFleetDispatchWake(ctx);
+  if (fleetWake?.kind === "short") return fleetWake.message;
+
   const wakePayload = buildWakePayload(ctx);
   const paperclipApiUrl = resolvePaperclipApiUrl(ctx.config.paperclipApiUrl);
   const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload, paperclipApiUrl);
@@ -550,7 +687,7 @@ export function buildWakeMessage(ctx: AdapterExecutionContext, binding?: ThreadB
   );
 
   const contextPrefix = binding ? buildContextPrefix(binding) : null;
-  const fleetDispatch = wakePayload.wakeReason === "fleet_dispatch" ? readFleetDispatch(ctx) : null;
+  const fleetDispatch = fleetWake?.kind === "fallback" ? fleetWake.dispatch : null;
   const fleetDispatchBlock = fleetDispatch ? buildFleetDispatchBlock(fleetDispatch) : null;
 
   const parts = [contextPrefix, fleetDispatchBlock, text].filter(
@@ -768,6 +905,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const timeoutMs = timeoutSec > 0 ? timeoutSec * 1000 : 0;
   const injectUrl = apiUrl(baseUrl, "/api/inject");
   const message = buildWakeMessage(ctx, binding);
+  const fleetWake = resolveFleetDispatchWake(ctx);
+  if (fleetWake?.kind === "fallback") {
+    await ctx.onLog("stderr", `${LOG_PREFIX} ${fleetWake.reason}; sending the generic wake${fleetWake.dispatch ? " with the legacy Fleet dispatch block" : ""}\n`);
+  }
 
   if (ctx.onMeta) {
     await ctx.onMeta({

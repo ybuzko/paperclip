@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AdapterExecutionContext, AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
 import {
   buildFleetDispatchBlock,
+  buildShortFleetDispatchMessage,
   buildWakeMessage,
   composeThreadKey,
   execute,
@@ -249,7 +250,11 @@ describe("buildWakeMessage / fleet_dispatch", () => {
 describe("buildFleetDispatchBlock", () => {
   it("renders deterministic, decimal-free prose with no keys parenthetical when the close list is empty", () => {
     const block = buildFleetDispatchBlock({
+      version: null,
       jiraProject: "FT",
+      assignment: null,
+      declineReassignTo: null,
+      modelExclusions: [],
       readyTasks: 0,
       epicsToExplode: 0,
       epicsToClose: 0,
@@ -309,6 +314,199 @@ describe("readFleetDispatch", () => {
     expect(readFleetDispatch(ctx)).toBeNull();
     ctx.context.fleetDispatch = { ...({} as Record<string, unknown>), jiraProject: "FT", readyTasks: 1, epicsToExplode: 0, epicsToClose: 0, epicKeysToClose: [], throttleState: "PURPLE", fiveHourPct: 1, sevenDayPct: 1, sevenDayResetsAt: "2026-10-01T00:00:00.000Z", ackFormat: "ACK" };
     expect(readFleetDispatch(ctx)).toBeNull();
+  });
+});
+
+describe("fleet dispatch v2", () => {
+  const V1 = {
+    jiraProject: "GAME",
+    readyTasks: 2,
+    epicsToExplode: 0,
+    epicsToClose: 0,
+    epicKeysToClose: [],
+    throttleState: "OPEN",
+    fiveHourPct: 17,
+    sevenDayPct: 52,
+    sevenDayResetsAt: "2026-10-18T13:00:00.896Z",
+    ackFormat: "fleet-ack: worked=<KEY> outcome=<done|declined|partial>",
+  };
+  const V2 = {
+    ...V1,
+    version: 2,
+    assignment: {
+      key: "GAME-53",
+      summary: "Emulation enablement — GOG collection (DOS slice)",
+      status: "In Progress",
+      kind: "task",
+    },
+    declineReassignTo: { accountId: "712020:074bdf3b-c75b-4363-90bd-0e17ac4cfeb2", email: "yaroslav@buzko.com" },
+    modelExclusions: [],
+  };
+
+  function dispatchCtx(fleetDispatch: unknown, wakeReason = "fleet_dispatch"): AdapterExecutionContext {
+    const ctx = makeCtx({ url: "http://127.0.0.1:1", apiToken: API_TOKEN });
+    ctx.context.wakeReason = wakeReason;
+    ctx.context.fleetDispatch = fleetDispatch;
+    return ctx;
+  }
+
+  it.each(["OPEN", "CAPPED", "RED", "STALE", "GREEN", "AMBER", "ACCELERATE"])(
+    "validates throttleState %s",
+    (state) => {
+      expect(readFleetDispatch(dispatchCtx({ ...V1, throttleState: state }))?.throttleState).toBe(state);
+    },
+  );
+
+  it("validates a v1 payload with the v2 fields defaulted", () => {
+    const dispatch = readFleetDispatch(dispatchCtx({ ...V1, throttleState: "GREEN" }));
+    expect(dispatch).not.toBeNull();
+    expect(dispatch?.version).toBeNull();
+    expect(dispatch?.assignment).toBeNull();
+    expect(dispatch?.declineReassignTo).toBeNull();
+    expect(dispatch?.modelExclusions).toEqual([]);
+  });
+
+  it("reads the v2 fields", () => {
+    const dispatch = readFleetDispatch(dispatchCtx({ ...V2, modelExclusions: ["fable", " ", 3] }));
+    expect(dispatch?.version).toBe(2);
+    expect(dispatch?.assignment).toEqual(V2.assignment);
+    expect(dispatch?.declineReassignTo).toEqual(V2.declineReassignTo);
+    expect(dispatch?.modelExclusions).toEqual(["fable"]);
+  });
+
+  it("drops a malformed assignment without invalidating the payload", () => {
+    const dispatch = readFleetDispatch(dispatchCtx({ ...V2, assignment: { key: "GAME-1", kind: "bogus" } }));
+    expect(dispatch).not.toBeNull();
+    expect(dispatch?.assignment).toBeNull();
+  });
+
+  it("sends exactly the short message for a v2 task", () => {
+    const ctx = dispatchCtx(V2);
+    const resolution = resolveThreadBinding(ctx);
+    expect(resolution.ok).toBe(true);
+    if (!resolution.ok) return;
+    expect(buildWakeMessage(ctx, resolution.binding)).toBe(
+      [
+        'Fleet dispatch, Jira GAME: work GAME-53 (In Progress, "Emulation enablement — GOG collection (DOS slice)").',
+        "If you cannot advance it, reassign it in Jira to yaroslav@buzko.com with a comment saying why.",
+        "End your reply with one line: fleet-ack: worked=GAME-53 outcome=done|declined|partial",
+      ].join("\n"),
+    );
+  });
+
+  it("renders the epic_explode line", () => {
+    const message = buildWakeMessage(
+      dispatchCtx({ ...V2, assignment: { key: "GAME-9", summary: "Retro hub", status: "To Do", kind: "epic_explode" } }),
+    );
+    expect(message).toBe(
+      [
+        'Fleet dispatch, Jira GAME: break epic GAME-9 ("Retro hub") into tasks assigned to yourself, then move the epic to In Progress.',
+        "If you cannot advance it, reassign it in Jira to yaroslav@buzko.com with a comment saying why.",
+        "End your reply with one line: fleet-ack: worked=GAME-9 outcome=done|declined|partial",
+      ].join("\n"),
+    );
+  });
+
+  it("renders the epic_close line", () => {
+    const message = buildWakeMessage(
+      dispatchCtx({ ...V2, assignment: { key: "GAME-9", summary: "Retro hub", status: "In Progress", kind: "epic_close" } }),
+    );
+    expect(message).toBe(
+      [
+        'Fleet dispatch, Jira GAME: epic GAME-9 ("Retro hub") has all children complete; review the outcome and close it, or reopen work.',
+        "If you cannot advance it, reassign it in Jira to yaroslav@buzko.com with a comment saying why.",
+        "End your reply with one line: fleet-ack: worked=GAME-9 outcome=done|declined|partial",
+      ].join("\n"),
+    );
+  });
+
+  it("adds the budget line before the ack line when CAPPED", () => {
+    const lines = buildWakeMessage(dispatchCtx({ ...V2, throttleState: "CAPPED" })).split("\n");
+    expect(lines).toHaveLength(4);
+    expect(lines[2]).toBe("Budget is tight: keep this turn small.");
+    expect(lines[3]).toBe("End your reply with one line: fleet-ack: worked=GAME-53 outcome=done|declined|partial");
+  });
+
+  it("adds the budget line with exclusions even when OPEN", () => {
+    const lines = buildWakeMessage(dispatchCtx({ ...V2, modelExclusions: ["fable"] })).split("\n");
+    expect(lines).toHaveLength(4);
+    expect(lines[2]).toBe("Budget is tight: keep this turn small. Do not use: fable.");
+  });
+
+  it("omits the budget line for RED and STALE without exclusions", () => {
+    for (const state of ["RED", "STALE"]) {
+      expect(buildWakeMessage(dispatchCtx({ ...V2, throttleState: state }))).not.toContain("Budget is tight");
+    }
+  });
+
+  it("falls back to the reassign target's accountId, then to the human", () => {
+    const dispatch = readFleetDispatch(dispatchCtx({ ...V2, declineReassignTo: { accountId: "acc-1" } }))!;
+    expect(buildShortFleetDispatchMessage(dispatch, dispatch.assignment!)).toContain("reassign it in Jira to acc-1 with");
+    const none = readFleetDispatch(dispatchCtx({ ...V2, declineReassignTo: null }))!;
+    expect(buildShortFleetDispatchMessage(none, none.assignment!)).toContain("reassign it in Jira to the human with");
+  });
+
+  it("leaves out missing status or summary in the task line", () => {
+    const dispatch = readFleetDispatch(dispatchCtx({ ...V2, assignment: { key: "GAME-53", kind: "task" } }))!;
+    expect(buildShortFleetDispatchMessage(dispatch, dispatch.assignment!).split("\n")[0]).toBe(
+      "Fleet dispatch, Jira GAME: work GAME-53.",
+    );
+  });
+
+  it("renders the legacy block inside the generic wake for a v1 payload", () => {
+    const ctx = dispatchCtx(V1);
+    const resolution = resolveThreadBinding(ctx);
+    if (!resolution.ok) throw new Error("binding failed");
+    const message = buildWakeMessage(ctx, resolution.binding);
+    expect(message.startsWith("Project: Fleet Tools")).toBe(true);
+    expect(message).toContain("Fleet dispatch — the governor allows work (state OPEN, 5h window 17%, 7-day window 52%, resets 2026-10-18).");
+    expect(message).toContain("PAPERCLIP_WAKE_REASON=fleet_dispatch");
+    expect(message).not.toContain("Budget is tight");
+  });
+
+  it("renders the legacy block for v2 with a null assignment, and CAPPED gets the AMBER budget sentence", () => {
+    const message = buildWakeMessage(dispatchCtx({ ...V2, assignment: null, throttleState: "CAPPED" }));
+    expect(message).toContain("Fleet dispatch — the governor allows work (state CAPPED");
+    expect(message).toContain("Budget is tight: prefer the smallest ready item.");
+    expect(message).toContain("PAPERCLIP_RUN_ID=run-1");
+  });
+
+  it("renders the legacy block when the version is not 2", () => {
+    const message = buildWakeMessage(dispatchCtx({ ...V2, version: 3 }));
+    expect(message).toContain("Fleet dispatch — the governor allows work");
+    expect(message).not.toContain("Fleet dispatch, Jira GAME:");
+  });
+
+  it("leaves a non-dispatch wake unchanged even with a v2 payload present", () => {
+    const withPayload = buildWakeMessage(dispatchCtx(V2, "issue_assigned"));
+    const without = buildWakeMessage(makeCtx({ url: "http://127.0.0.1:1", apiToken: API_TOKEN }));
+    expect(withPayload).toBe(without);
+    expect(withPayload).not.toContain("Fleet dispatch");
+  });
+
+  it("execute injects the short message and logs a fallback once", async () => {
+    const daemon = await startStub();
+    const logs: string[] = [];
+    const run = async (fleetDispatch: unknown) => {
+      const ctx = makeCtx(
+        { url: daemon.url, apiToken: API_TOKEN },
+        { onLog: async (_stream, chunk) => void logs.push(chunk) },
+      );
+      ctx.context.wakeReason = "fleet_dispatch";
+      ctx.context.fleetDispatch = fleetDispatch;
+      return execute(ctx);
+    };
+
+    await run(V2);
+    const shortBody = daemon.requests.at(-1)?.body as Record<string, unknown>;
+    expect(String(shortBody.message).startsWith("Fleet dispatch, Jira GAME: work GAME-53")).toBe(true);
+    expect(logs.some((line) => line.includes("sending the generic wake"))).toBe(false);
+
+    await run(V1);
+    const fallbackLogs = logs.filter((line) => line.includes("sending the generic wake"));
+    expect(fallbackLogs).toEqual([
+      "[claudeclaw-gateway] fleet dispatch payload version none is not 2; sending the generic wake with the legacy Fleet dispatch block\n",
+    ]);
   });
 });
 
