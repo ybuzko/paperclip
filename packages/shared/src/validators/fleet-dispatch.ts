@@ -22,6 +22,11 @@ export const dispatchJiraSettingsSchema = z
     baseUrl: z.string().min(1),
     email: z.string().min(1),
     tokenSecretId: z.string().min(1),
+    // The human a declined dispatch assignment is reassigned to in Jira
+    // (dispatch-service.ts `resolveDeclineReassignTarget`). Optional, no
+    // default: unset means declines are logged and left alone.
+    humanAccountId: z.string().min(1).optional(),
+    humanEmail: z.string().min(1).optional(),
   })
   .strict();
 

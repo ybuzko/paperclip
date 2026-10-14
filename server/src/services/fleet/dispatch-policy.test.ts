@@ -3,11 +3,14 @@ import {
   DEFAULT_DISPATCH_PARAMS,
   computeEpicsToClose,
   countsFingerprint,
+  decideDeclineReassignment,
   decideDispatch,
   epicsToCloseCandidateJql,
   epicsToExplodeJql,
   jqlQuote,
+  parseFleetAck,
   readyTasksJql,
+  selectAssignment,
   unfinishedChildrenJql,
   type DecideDispatchInput,
 } from "./dispatch-policy.js";
@@ -344,5 +347,213 @@ describe("decideDispatch", () => {
   it("nudges immediately on the very first poll for a project (no lastNudgeAt)", () => {
     const result = decideDispatch(baseInput({ lastNudgeAt: null, backoffLevel: 0, previousCountsFingerprint: null }));
     expect(result.nudge).toBe(true);
+  });
+});
+
+describe("decideDispatch with a declined ack", () => {
+  it("does not reset backoff on a declined ack when the counts are unchanged", () => {
+    const fp = countsFingerprint({ readyTasks: 1, epicsToExplode: 0, epicsToClose: 0 });
+    const lastNudgeAt = new Date(NOW.getTime() - 61 * 60 * 1000);
+    const result = decideDispatch(
+      baseInput({
+        lastNudgeAt,
+        backoffLevel: 1,
+        previousCountsFingerprint: fp,
+        lastAckAt: new Date(lastNudgeAt.getTime() + 60 * 1000),
+        lastAckOutcome: "declined",
+      }),
+    );
+    expect(result.nextBackoffLevel).toBe(1);
+    expect(result.nudge).toBe(false);
+    expect(result.reason).toContain("backoff");
+  });
+
+  it("resets backoff after a declined ack once the counts change (the reassignment moved them)", () => {
+    const lastNudgeAt = new Date(NOW.getTime() - 61 * 60 * 1000);
+    const result = decideDispatch(
+      baseInput({
+        lastNudgeAt,
+        backoffLevel: 1,
+        previousCountsFingerprint: countsFingerprint({ readyTasks: 2, epicsToExplode: 0, epicsToClose: 0 }),
+        lastAckAt: new Date(lastNudgeAt.getTime() + 60 * 1000),
+        lastAckOutcome: "declined",
+      }),
+    );
+    expect(result.nextBackoffLevel).toBe(0);
+    expect(result.nudge).toBe(true);
+  });
+
+  it("still resets backoff on a done or partial ack", () => {
+    const fp = countsFingerprint({ readyTasks: 1, epicsToExplode: 0, epicsToClose: 0 });
+    const lastNudgeAt = new Date(NOW.getTime() - 61 * 60 * 1000);
+    for (const outcome of ["done", "partial"] as const) {
+      const result = decideDispatch(
+        baseInput({
+          lastNudgeAt,
+          backoffLevel: 1,
+          previousCountsFingerprint: fp,
+          lastAckAt: new Date(lastNudgeAt.getTime() + 60 * 1000),
+          lastAckOutcome: outcome,
+        }),
+      );
+      expect(result.nextBackoffLevel).toBe(0);
+    }
+  });
+
+  it("treats the governor's OPEN like GREEN and CAPPED as non-blocking (unchanged rules)", () => {
+    expect(decideDispatch(baseInput({ governor: { state: "OPEN", stale: false, fiveHourPct: 10, floor5h: 80 } })).nudge).toBe(true);
+    expect(decideDispatch(baseInput({ governor: { state: "CAPPED", stale: false, fiveHourPct: 10, floor5h: 80 } })).nudge).toBe(true);
+    expect(decideDispatch(baseInput({ governor: { state: "STALE", stale: true, fiveHourPct: 10, floor5h: 80 } })).nudge).toBe(false);
+  });
+});
+
+describe("parseFleetAck", () => {
+  it("parses the v2 form", () => {
+    expect(parseFleetAck("Done.\nfleet-ack: worked=GAME-53 outcome=done")).toEqual({
+      worked: "GAME-53",
+      kind: null,
+      outcome: "done",
+    });
+  });
+
+  it("parses the legacy kind= form", () => {
+    expect(parseFleetAck("fleet-ack: worked=FT-1 kind=epic_close outcome=partial")).toEqual({
+      worked: "FT-1",
+      kind: "epic_close",
+      outcome: "partial",
+    });
+  });
+
+  it("takes the last ack line when there are several", () => {
+    expect(
+      parseFleetAck("fleet-ack: worked=FT-1 outcome=done\nmore text\nfleet-ack: worked=FT-2 outcome=declined")?.worked,
+    ).toBe("FT-2");
+  });
+
+  it("ignores surrounding markdown", () => {
+    expect(parseFleetAck("`fleet-ack: worked=`FT-3` outcome=declined`")).toEqual({
+      worked: "FT-3",
+      kind: null,
+      outcome: "declined",
+    });
+  });
+
+  it("returns null for no ack, an unknown outcome, or empty input", () => {
+    expect(parseFleetAck("all good")).toBeNull();
+    expect(parseFleetAck("fleet-ack: worked=FT-1 outcome=maybe")).toBeNull();
+    expect(parseFleetAck("fleet-ack: worked=FT-1 kind=bogus outcome=done")).toBeNull();
+    expect(parseFleetAck(null)).toBeNull();
+    expect(parseFleetAck("")).toBeNull();
+  });
+});
+
+describe("selectAssignment", () => {
+  const issue = (key: string, statusName: string, created: string | null, updated: string | null = null) => ({
+    key,
+    summary: `S ${key}`,
+    statusName,
+    created,
+    updated,
+  });
+
+  it("picks In Progress tasks first, oldest updated first", () => {
+    expect(
+      selectAssignment({
+        tasks: [
+          issue("FT-1", "To Do", "2025-01-01T00:00:00Z"),
+          issue("FT-2", "In Progress", "2026-01-01T00:00:00Z", "2026-03-01T00:00:00Z"),
+          issue("FT-3", "In Progress", "2026-02-01T00:00:00Z", "2026-02-15T00:00:00Z"),
+        ],
+        epicsToClose: [issue("FT-9", "In Progress", "2020-01-01T00:00:00Z")],
+        epicsToExplode: [],
+      }),
+    ).toEqual({ key: "FT-3", summary: "S FT-3", status: "In Progress", kind: "task" });
+  });
+
+  it("then To Do tasks, oldest created first", () => {
+    expect(
+      selectAssignment({
+        tasks: [
+          issue("FT-5", "To Do", "2026-02-01T00:00:00Z", "2020-01-01T00:00:00Z"),
+          issue("FT-4", "To Do", "2026-01-01T00:00:00Z", "2026-05-01T00:00:00Z"),
+        ],
+        epicsToClose: [],
+        epicsToExplode: [],
+      })?.key,
+    ).toBe("FT-4");
+  });
+
+  it("puts other configured ready statuses after To Do", () => {
+    expect(
+      selectAssignment({
+        tasks: [issue("FT-6", "In Review", "2020-01-01T00:00:00Z"), issue("FT-7", "To Do", "2026-01-01T00:00:00Z")],
+        epicsToClose: [],
+        epicsToExplode: [],
+      })?.key,
+    ).toBe("FT-7");
+  });
+
+  it("then epics to close, then epics to explode", () => {
+    expect(
+      selectAssignment({
+        tasks: [],
+        epicsToClose: [issue("FT-20", "In Progress", "2026-02-01T00:00:00Z"), issue("FT-21", "In Progress", "2026-01-01T00:00:00Z")],
+        epicsToExplode: [issue("FT-30", "To Do", "2020-01-01T00:00:00Z")],
+      }),
+    ).toEqual({ key: "FT-21", summary: "S FT-21", status: "In Progress", kind: "epic_close" });
+    expect(
+      selectAssignment({ tasks: [], epicsToClose: [], epicsToExplode: [issue("FT-30", "To Do", "2020-01-01T00:00:00Z")] }),
+    ).toMatchObject({ key: "FT-30", kind: "epic_explode" });
+  });
+
+  it("sorts missing timestamps last and breaks ties on the key", () => {
+    expect(
+      selectAssignment({
+        tasks: [issue("FT-10", "To Do", null), issue("FT-9", "To Do", "2026-01-01T00:00:00Z"), issue("FT-8", "To Do", "2026-01-01T00:00:00Z")],
+        epicsToClose: [],
+        epicsToExplode: [],
+      })?.key,
+    ).toBe("FT-8");
+  });
+
+  it("returns null when nothing is ready", () => {
+    expect(selectAssignment({ tasks: [], epicsToClose: [], epicsToExplode: [] })).toBeNull();
+  });
+});
+
+describe("decideDeclineReassignment", () => {
+  const target = { accountId: "human-acc", email: "human@example.com" };
+
+  it("reassigns when the issue is still assigned to the supervisor", () => {
+    expect(
+      decideDeclineReassignment({ key: "FT-1", supervisorAccountId: "acc-1", currentAssigneeAccountId: "acc-1", target, mode: "enforce" }),
+    ).toEqual({ action: "reassign", key: "FT-1", toAccountId: "human-acc", toEmail: "human@example.com" });
+  });
+
+  it("reports a mismatch when assigned to someone else or unassigned", () => {
+    expect(
+      decideDeclineReassignment({ key: "FT-1", supervisorAccountId: "acc-1", currentAssigneeAccountId: "other", target, mode: "enforce" }),
+    ).toEqual({ action: "decline_mismatch", key: "FT-1", currentAssigneeAccountId: "other" });
+    expect(
+      decideDeclineReassignment({ key: "FT-1", supervisorAccountId: "acc-1", currentAssigneeAccountId: null, target, mode: "enforce" }),
+    ).toEqual({ action: "decline_mismatch", key: "FT-1", currentAssigneeAccountId: null });
+  });
+
+  it("only reports in shadow mode", () => {
+    expect(
+      decideDeclineReassignment({ key: "FT-1", supervisorAccountId: "acc-1", currentAssigneeAccountId: "acc-1", target, mode: "shadow" }).action,
+    ).toBe("shadow_would_reassign");
+    expect(
+      decideDeclineReassignment({ key: "FT-1", supervisorAccountId: "acc-1", currentAssigneeAccountId: "other", target, mode: "shadow" }).action,
+    ).toBe("shadow_decline_mismatch");
+  });
+
+  it("skips without a configured human or with a non-key", () => {
+    expect(
+      decideDeclineReassignment({ key: "FT-1", supervisorAccountId: "acc-1", currentAssigneeAccountId: "acc-1", target: null, mode: "enforce" }).action,
+    ).toBe("skip_no_target");
+    expect(
+      decideDeclineReassignment({ key: "none", supervisorAccountId: "acc-1", currentAssigneeAccountId: "acc-1", target, mode: "enforce" }).action,
+    ).toBe("skip_invalid_key");
   });
 });

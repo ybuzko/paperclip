@@ -2,18 +2,25 @@
 
 The fleet dispatch loop nudges a project's remote supervisor (a `claudeclaw_gateway`
 agent) awake when Jira says there is ready work assigned to it and the fleet
-governor's throttle state (see `./README.md`) allows new work. It never
-executes work itself, never talks to Jira on the agent's behalf, and — like
-the governor — is pure sensing plus a wake in `enforce` mode; in `shadow`
-mode it only polls and records what it *would* have done.
+governor's throttle state (see `./README.md`) allows new work. The server
+picks the ONE Jira item each nudge is about (see "Ticket selection"). It never
+executes work itself; its only Jira writes are reassigning a *declined*
+assignment to the configured human, with a comment (see "Decline"). Paperclip
+issues already assigned to the supervisor take priority over Jira nudges (see
+"Paperclip-issue priority"). In `shadow` mode it only polls and records what
+it *would* have done.
 
 Three modules:
 
-- `./jira-client.ts` — a minimal Jira Cloud REST v3 client (approximate
-  counts + paginated key search). No policy, no persistence.
-- `./dispatch-policy.ts` — pure functions: the JQL for "ready work", and
-  `decideDispatch()`, the nudge/backoff decision. No I/O, mirrors
-  `./policy.ts`'s purity contract.
+- `./jira-client.ts` — a minimal Jira Cloud REST client (approximate
+  counts, paginated issue search, `getIssue`, and the two writes
+  `assignIssue` — `PUT /rest/api/3/issue/{key}/assignee` — and `addComment`
+  — `POST /rest/api/2/issue/{key}/comment`, plain-text body). No policy, no
+  persistence.
+- `./dispatch-policy.ts` — pure functions: the JQL for "ready work",
+  `selectAssignment()` (ticket selection), `parseFleetAck()`,
+  `decideDeclineReassignment()`, and `decideDispatch()`, the nudge/backoff
+  decision. No I/O, mirrors `./policy.ts`'s purity contract.
 - `./dispatch-service.ts` — the I/O layer: polls Jira, reads the governor's
   latest decision, calls `decideDispatch()`, persists `fleet_dispatch_state`,
   and (in `enforce` mode) creates/updates the project's standing dispatch
@@ -41,6 +48,27 @@ with no children at all — `dispatch-policy.ts`'s `computeEpicsToClose()`).
 `epicKeysToClose` on the wake payload is capped at 20 keys; `epicsToClose`
 itself is the full (uncapped) count.
 
+All three lists are fetched with `GET /rest/api/3/search/jql` and fields
+`key,summary,status,issuetype,created,updated,parent`; the counts are the
+list lengths.
+
+## Ticket selection (`selectAssignment()`)
+
+The server picks the ONE item a nudge is about, in this order:
+
+1. tasks in **In Progress**, oldest `updated` first;
+2. tasks in **To Do**, oldest `created` first;
+3. tasks in any other configured ready status (`JIRA_READY_STATUSES`
+   override), oldest `created` first;
+4. **epics to close** (all children done), oldest `created` first;
+5. **epics to explode**, oldest `created` first.
+
+Ties break on the issue key; a missing timestamp sorts last. The selection is
+recorded every tick in `fleet_dispatch_state.last_decision.assignment`, and
+the item the last Jira nudge was actually about in
+`last_decision.nudgedAssignment` (carried forward between nudges). No
+migration: both live in the existing `last_decision` jsonb.
+
 ## Project eligibility
 
 A project participates in the loop when, every tick:
@@ -62,15 +90,19 @@ per-run admission class (`./types.ts`'s `ProjectClass`).
 
 ## Decision rules (`decideDispatch()`, in order)
 
+0. **Paperclip-issue priority** (in the service, before `decideDispatch()`
+   runs for Jira; see below) → no Jira nudge this tick.
 1. **No work** (`readyTasks + epicsToExplode + epicsToClose === 0`) → no nudge.
 2. **Agent busy** (the supervisor already has a `heartbeat_runs` row in
    `queued` or `running` for this project's lead agent) → no nudge.
-3. **Governor stale** (no fresh-enough throttle decision) → no nudge.
+3. **Governor stale** (no fresh-enough throttle decision, or state `STALE`) → no nudge.
 4. **Governor RED** → no nudge.
 5. **5h utilization ≥ `floor_5h`** (independent of state, same floor as the
    governor's `FR-4.6`) → no nudge.
-6. **Governor AMBER** → nudge only `P0`/`P1` projects.
-7. **GREEN / ACCELERATE** → nudge (subject to the gaps below).
+6. **Governor AMBER** (legacy state name) → nudge only `P0`/`P1` projects.
+7. **OPEN / CAPPED** (and the legacy GREEN / ACCELERATE) → nudge (subject to
+   the gaps below). `CAPPED` is passed through to the supervisor as
+   `throttleState` so the adapter can ask for a small turn.
 8. **`min_nudge_gap`**: never nudge the same project twice within
    `minNudgeGapMs` (default 15 min) of the last nudge.
 9. **`backoff`**: if the last nudge is *stuck* (no ack since, counts
@@ -90,7 +122,11 @@ since it was sent and the ready-work counts fingerprint
 (`readyTasks:epicsToExplode:epicsToClose`) equals the one recorded when it was
 sent (`counts_fingerprint` is only rewritten on a nudge).
 
-- an ack at/after the last nudge, or any change in the counts → level resets to 0;
+- an ack at/after the last nudge with outcome `done` or `partial`, or any
+  change in the counts → level resets to 0;
+- an ack with outcome `declined` does **not** reset the level by itself; the
+  reassignment it triggers removes the item from the supervisor's ready
+  work, and that change in the counts is what resets the level;
 - the level rises only when a stuck nudge has waited out its delay and the
   next nudge goes out — once per nudge, never per poll, so the delays hold at
   any `pollIntervalMs`.
@@ -104,23 +140,82 @@ cycle) does not reset backoff — only an ack timestamped at/after
 
 ## Ack format
 
-After working one ready item, the supervisor replies on the project's
-standing dispatch issue with a single-line comment:
+The supervisor ends its reply to the nudge with one line:
 
 ```
-fleet-ack: worked=<KEY> kind=<task|epic_explode|epic_close> outcome=<done|declined|partial>
+fleet-ack: worked=<KEY> outcome=<done|declined|partial>
 ```
 
-- `<KEY>` — the Jira issue key worked (e.g. `FT-123`).
-- `kind` — `task` (a ready task), `epic_explode` (broke an epic into
-  children), or `epic_close` (closed a finished epic).
-- `outcome` — `done`, `declined` (skipped — blocked, out of scope, etc.), or
-  `partial` (started, not finished).
+- `<KEY>` — the Jira issue key the nudge named (e.g. `FT-123`).
+- `outcome` — `done`, `partial` (started, not finished), or `declined`
+  (cannot advance it; see "Decline").
 
-The service scans `issue_comments` on the dispatch issue created strictly
-after `last_nudge_at` for the most recent comment matching this format; a
-match becomes `fleet_dispatch_state.last_ack` (`{at, worked, kind, outcome}`)
-and feeds the backoff reset above.
+The legacy form `fleet-ack: worked=<KEY> kind=<task|epic_explode|epic_close> outcome=<...>`
+is still accepted everywhere. If several ack lines appear, the last one wins.
+
+Where the ack is read from, each tick:
+
+1. **Primary — the nudge's run result.** The nudge's heartbeat run id is
+   `fleet_dispatch_state.last_nudge_wake_id`. Once that run has finished
+   (`finished_at` set), the supervisor's reply — which the
+   `claudeclaw_gateway` adapter returns as the run `summary` and heartbeat.ts
+   persists as `heartbeat_runs.result_json.summary` (also echoed to stdout,
+   so the tail of `stdout_excerpt`) — is scanned for the ack line
+   (`result_json.summary`, then `result_json.result`, then `stdout_excerpt`).
+2. **Fallback — a PIX comment.** A comment on the standing dispatch issue
+   created strictly after `last_nudge_at` in either format.
+
+A finished run with no ack in either place is an un-acked nudge (normal
+backoff). A match becomes `fleet_dispatch_state.last_ack`
+(`{id, source, at, worked, kind, outcome, decline?}`; `id` is
+`run:<run id>` or `comment:<comment id>`, `kind` is null for the v2 form).
+
+## Decline
+
+When a **new** ack (an `id` different from the one already in `last_ack`) has
+`outcome=declined`, before Jira is polled for ready work:
+
+1. If `jira.humanAccountId`/`jira.humanEmail` are not both set → warn,
+   record `decline.action = "skip_no_target"`, change nothing.
+2. `GET` the Jira issue's `assignee`.
+3. If the assignee is the supervisor (the lead agent's `jiraAccountId`) →
+   `PUT` the assignee to `humanAccountId`, then add a comment:
+   `Declined by fleet supervisor <agent name> at <ack time, America/Los_Angeles>; reassigned to <humanEmail> for investigation. Agent reply: <first 500 chars of the reply>`.
+   Recorded as `decline.action = "reassigned"`. The key is dropped from this
+   tick's ready lists even if Jira's search index still shows it.
+4. If the issue is assigned to someone else or unassigned → leave Jira alone,
+   log, and record `decline.action = "decline_mismatch"`.
+5. In `shadow` mode, steps 3/4 only log and record
+   `shadow_would_reassign` / `shadow_decline_mismatch` (the `GET` still runs;
+   nothing is written to Jira).
+
+The result is stored on `last_ack.decline`, so each ack is handled exactly once
+across ticks and restarts. A transient Jira error (`429`/`5xx`/timeout) is
+recorded with `retryable: true` and retried on the next tick; any other error
+is recorded and not retried.
+
+## Paperclip-issue priority
+
+Before computing a Jira nudge, the service looks for Paperclip issues in the
+project's company assigned to the lead agent with `status in (todo,
+in_progress)`, `origin_kind != "fleet_dispatch"` (i.e. not the standing
+dispatch issue) and not hidden (`hidden_at is null`). If there is one:
+
+- The Jira nudge is skipped for this project this tick (Jira is still polled
+  and the counts/selection recorded); `last_decision.reason` is
+  `paperclip_issue_priority: <PIX-nn>`, with ` (held: <reason>)` appended
+  when the wake below is held.
+- The wake is gated exactly like a Jira nudge — agent busy, governor
+  stale/RED/floor/AMBER-class, and `minNudgeGapMs` since the last wake of
+  either kind — but without backoff.
+- When allowed (in `enforce` mode), the supervisor is woken for the OLDEST
+  such issue (by `created_at`) via the heartbeat `wakeup()` the way assignment
+  wakes are (`source: "assignment"`, `payload/contextSnapshot.issueId`),
+  with `reason: "fleet_pending_issue"`, so the adapter renders its generic
+  wake for that issue rather than the short dispatch message. Recorded in
+  `last_decision.pendingIssueWake` (`{issueId, identifier, at, runId}`).
+  `last_nudge_at`, the counts fingerprint and the backoff level are not
+  touched.
 
 ## The standing dispatch issue
 
@@ -129,8 +224,10 @@ assigned to the lead agent with `status = in_progress`. It is created lazily
 (on the first `enforce`-mode nudge) via `issueService(db).create()`, reused
 on every subsequent nudge (re-opened/re-assigned if someone changed it), and
 its id is cached in `fleet_dispatch_state.dispatch_issue_id`. It is not a
-task with an acceptance criterion of its own — it exists purely as a place
-for nudges to describe themselves and for acks to land.
+task with an acceptance criterion of its own — it anchors the nudge runs,
+documents the ack format and rules in its description, and is where legacy
+ack comments land. Its `origin_kind` (`fleet_dispatch`) excludes it from the
+Paperclip-issue priority check.
 
 ## The wake
 
@@ -138,12 +235,21 @@ In `enforce` mode, a nudge calls the heartbeat scheduler's `wakeup(agentId, …)
 with `reason: "fleet_dispatch"` and a `fleetDispatch` object on both `payload`
 and `contextSnapshot`:
 
-```ts
+```jsonc
 {
-  jiraProject, readyTasks, epicsToExplode, epicsToClose, epicKeysToClose,
-  throttleState, fiveHourPct, sevenDayPct, sevenDayResetsAt, ackFormat,
+  "version": 2,
+  "jiraProject": "GAME",
+  "assignment": { "key": "GAME-53", "summary": "…", "status": "In Progress", "kind": "task" | "epic_explode" | "epic_close" },
+  "declineReassignTo": { "accountId": "…", "email": "…" },   // omitted unless jira.humanAccountId + humanEmail are set
+  "throttleState": "OPEN" | "CAPPED" | "RED" | "STALE",       // the governor's latest state, passed through
+  "fiveHourPct": 17, "sevenDayPct": 52, "sevenDayResetsAt": "…",  // may be null
+  "modelExclusions": [],      // governor launch_parameters.excludedModels, lowercased
+  "ackFormat": "fleet-ack: worked=<KEY> outcome=<done|declined|partial>",
+  "readyTasks": 2, "epicsToExplode": 0, "epicsToClose": 0, "epicKeysToClose": []
 }
 ```
+
+`assignment` is null only when nothing is ready (which never nudges).
 
 See `packages/adapters/claudeclaw-gateway/README.md`'s "Fleet dispatch
 block" for how the adapter reads this off the execution context
@@ -162,7 +268,7 @@ calls `wakeup()` or touches the dispatch issue. This lets an operator watch
 
 | Key | Shape | Notes |
 | --- | --- | --- |
-| `jira` | `{baseUrl, email, tokenSecretId}` | Jira Cloud site + the company secret holding the API token. No default — the loop no-ops (`jiraConfigured: false`) until this is set. |
+| `jira` | `{baseUrl, email, tokenSecretId, humanAccountId?, humanEmail?}` | Jira Cloud site + the company secret holding the API token. No default — the loop no-ops (`jiraConfigured: false`) until this is set. `humanAccountId`/`humanEmail` name the human a declined assignment is reassigned to (and become the nudge's `declineReassignTo`); both must be set, otherwise declines are logged and left alone. The PATCH replaces the whole `jira` object, so send all fields. |
 | `dispatch_mode` | `{mode: "shadow" \| "enforce"}` | Default `shadow`. |
 | `dispatch_params` | overrides for `DispatchServiceParams` (`minNudgeGapMs`, `backoffMs`, `maxBackoffLevel`, `pollIntervalMs`) | Deep-merged onto `DEFAULT_DISPATCH_SERVICE_PARAMS`; `pollIntervalMs` (default 10 min) is `start()`'s reschedule interval. |
 
