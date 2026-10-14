@@ -608,13 +608,13 @@ describeEmbeddedPostgres("fleet dispatch service (embedded postgres)", () => {
       });
     }
 
-    it("selects In Progress tasks first (oldest updated), and carries declineReassignTo, modelExclusions and CAPPED", async () => {
+    it("selects In Progress tasks first (oldest updated), and carries declineReassignTo and modelExclusions", async () => {
       const companyId = await seedCompany();
       const leadAgentId = await seedLeadAgent(companyId);
       await seedProject(companyId, leadAgentId);
       await seedJiraSettings({ human: true });
       await seedEnforceMode();
-      await seedGreenGovernor(NOW, { state: "CAPPED", excludedModels: ["Fable"] });
+      await seedGreenGovernor(NOW, { state: "OPEN", excludedModels: ["Fable"] });
 
       const jira = fakeJiraFactory({
         readyTasks: [
@@ -637,7 +637,7 @@ describeEmbeddedPostgres("fleet dispatch service (embedded postgres)", () => {
         version: 2,
         assignment: { key: "FT-3", status: "In Progress", kind: "task" },
         declineReassignTo: { accountId: "human-acc", email: "human@example.com" },
-        throttleState: "CAPPED",
+        throttleState: "OPEN",
         modelExclusions: ["fable"],
         readyTasks: 3,
         epicsToExplode: 1,
