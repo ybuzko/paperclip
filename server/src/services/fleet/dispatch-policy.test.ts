@@ -400,9 +400,11 @@ describe("decideDispatch with a declined ack", () => {
     }
   });
 
-  it("treats the governor's OPEN like GREEN and CAPPED as non-blocking (unchanged rules)", () => {
+  it("nudges under OPEN, holds under CAPPED (weekly cap schedule) and STALE", () => {
     expect(decideDispatch(baseInput({ governor: { state: "OPEN", stale: false, fiveHourPct: 10, floor5h: 80 } })).nudge).toBe(true);
-    expect(decideDispatch(baseInput({ governor: { state: "CAPPED", stale: false, fiveHourPct: 10, floor5h: 80 } })).nudge).toBe(true);
+    const capped = decideDispatch(baseInput({ governor: { state: "CAPPED", stale: false, fiveHourPct: 10, floor5h: 80 } }));
+    expect(capped.nudge).toBe(false);
+    expect(capped.reason).toMatch(/^governor_capped/);
     expect(decideDispatch(baseInput({ governor: { state: "STALE", stale: true, fiveHourPct: 10, floor5h: 80 } })).nudge).toBe(false);
   });
 });

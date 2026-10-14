@@ -100,16 +100,19 @@ per-run admission class (`./types.ts`'s `ProjectClass`).
 5. **5h utilization ≥ `floor_5h`** (independent of state, same floor as the
    governor's `FR-4.6`) → no nudge.
 6. **Governor AMBER** (legacy state name) → nudge only `P0`/`P1` projects.
-7. **OPEN / CAPPED** (and the legacy GREEN / ACCELERATE) → nudge (subject to
-   the gaps below). `CAPPED` is passed through to the supervisor as
-   `throttleState` so the adapter can ask for a small turn.
-8. **`min_nudge_gap`**: never nudge the same project twice within
+7. **Governor CAPPED** (the weekly cap schedule is holding the fleet) → no
+   nudge. The admission gate would hold the run anyway; not nudging keeps the
+   supervisor from showing as busy with a queued run that cannot start.
+8. **OPEN** (and the legacy GREEN / ACCELERATE) → nudge (subject to the gaps
+   below). The governor state is passed through as `throttleState`; the
+   adapter adds a budget line when models are excluded.
+9. **`min_nudge_gap`**: never nudge the same project twice within
    `minNudgeGapMs` (default 15 min) of the last nudge.
-9. **`backoff`**: if the last nudge is *stuck* (no ack since, counts
+10. **`backoff`**: if the last nudge is *stuck* (no ack since, counts
    unchanged since it was sent), wait `backoffMs[backoffLevel]` before the
    next nudge (default: 60 min at level 0, 360 min at level 1). Sending that
    next nudge raises the level by one.
-10. **`needs_human`**: a stuck nudge at `maxBackoffLevel` (default 2) → no
+11. **`needs_human`**: a stuck nudge at `maxBackoffLevel` (default 2) → no
     nudge, `reason: "needs_human"`, until the counts move or an ack lands.
 
 Steps 1–10 are pure and unit-tested in `./dispatch-policy.test.ts`

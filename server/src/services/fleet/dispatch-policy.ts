@@ -380,6 +380,14 @@ export function decideDispatch(input: DecideDispatchInput): DecideDispatchResult
     return { nudge: false, reason: "governor_red: the fleet governor is RED; holding new nudges", nextBackoffLevel };
   }
 
+  if (governor.state === "CAPPED") {
+    return {
+      nudge: false,
+      reason: "governor_capped: the weekly cap schedule is holding the fleet; holding new nudges",
+      nextBackoffLevel,
+    };
+  }
+
   if (governor.fiveHourPct != null && governor.fiveHourPct >= governor.floor5h) {
     return {
       nudge: false,
