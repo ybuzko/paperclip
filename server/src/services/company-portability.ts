@@ -815,6 +815,11 @@ const ADAPTER_DEFAULT_RULES_BY_TYPE: Record<string, Array<{ path: string[]; valu
     { path: ["role"], value: "operator" },
     { path: ["scopes"], value: ["operator.admin"] },
   ],
+  claudeclaw_gateway: [
+    { path: ["timeoutSec"], value: 600 },
+    { path: ["paperclipApiUrl"], value: "http://10.0.0.34:3100" },
+    { path: ["claimedApiKeyPath"], value: ".claude/claudeclaw/paperclip.env" },
+  ],
 };
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

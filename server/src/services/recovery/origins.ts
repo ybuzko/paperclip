@@ -1,4 +1,6 @@
 export const RECOVERY_ORIGIN_KINDS = {
+  /** Standing per-project issue owned by the fleet dispatch loop (services/fleet/dispatch-service.ts). */
+  fleetDispatch: "fleet_dispatch",
   issueGraphLivenessEscalation: "harness_liveness_escalation",
   issueProductivityReview: "issue_productivity_review",
   strandedIssueRecovery: "stranded_issue_recovery",

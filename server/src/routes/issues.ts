@@ -249,9 +249,11 @@ import {
 } from "../services/issue-thread-interaction-resolution.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
 import {
+  agentIssueWriteRunContextOptional,
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
   observeCrossIssueInfluence,
+  recordAgentIssueWriteWithoutRunContext,
   type CrossIssueInfluenceKind,
 } from "../services/cross-issue-influence-limit.js";
 
@@ -2918,7 +2920,23 @@ export function issueRoutes(
     kind: CrossIssueInfluenceKind,
   ) {
     if (req.actor.type !== "agent") return true;
-    if (!req.actor.agentId || !req.actor.runId) throw crossIssueInfluenceRunContextError();
+    if (!req.actor.agentId) throw crossIssueInfluenceRunContextError();
+    if (!req.actor.runId) {
+      // No run at all: a long-lived agent key used outside a Paperclip-triggered
+      // run. Only the operator's optional run-context policy lets this through,
+      // and then it is audited rather than counted because there is no run to
+      // charge the per-run cap against.
+      if (!agentIssueWriteRunContextOptional()) throw crossIssueInfluenceRunContextError();
+      await recordAgentIssueWriteWithoutRunContext(db, {
+        companyId: issue.companyId,
+        agentId: req.actor.agentId,
+        responsibleUserId: req.actor.onBehalfOfUserId ?? null,
+        targetIssueId: issue.id,
+        targetIssueIdentifier: issue.identifier ?? null,
+        kind,
+      });
+      return true;
+    }
 
     // The counter transaction locks and validates the persisted run before it
     // derives the source issue. Never trust the API-key run header by itself.
@@ -4009,6 +4027,26 @@ export function issueRoutes(
     if (runId) return runId;
     res.status(401).json({ error: "Agent run id required" });
     return null;
+  }
+
+  /**
+   * Run id for agent board writes (interaction cards) that can legitimately
+   * originate outside a heartbeat run when the operator has set
+   * `PAPERCLIP_AGENT_ISSUE_WRITE_RUN_CONTEXT=optional`. Returns `ok: false`
+   * after writing the 401 when a run is required and absent. Run-lifecycle
+   * routes (checkout, release, recovery actions) keep using
+   * `requireAgentRunId` because they bind the issue to a run.
+   */
+  function resolveAgentBoardWriteRunId(
+    req: Request,
+    res: Response,
+  ): { ok: true; runId: string | null } | { ok: false } {
+    if (req.actor.type !== "agent") return { ok: true, runId: null };
+    const runId = req.actor.runId?.trim();
+    if (runId) return { ok: true, runId };
+    if (agentIssueWriteRunContextOptional()) return { ok: true, runId: null };
+    res.status(401).json({ error: "Agent run id required" });
+    return { ok: false };
   }
 
   async function hasActiveCheckoutManagementOverride(
@@ -11228,8 +11266,9 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const agentSourceRunId = req.actor.type === "agent" ? requireAgentRunId(req, res) : null;
-    if (req.actor.type === "agent" && !agentSourceRunId) return;
+    const agentBoardWriteRun = resolveAgentBoardWriteRunId(req, res);
+    if (!agentBoardWriteRun.ok) return;
+    const agentSourceRunId = agentBoardWriteRun.runId;
     if (
       req.body.kind === "request_confirmation"
       && req.body.addresseeAgentId

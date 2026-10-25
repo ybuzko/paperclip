@@ -23,6 +23,7 @@ import {
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
   productivityReviewService,
 } from "../services/productivity-review.ts";
+import { RECOVERY_ORIGIN_KINDS } from "../services/recovery/origins.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -525,6 +526,23 @@ describeEmbeddedPostgres("productivity review service", () => {
 
     expect(unpausedResult.created).toBe(1);
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
+  });
+
+  it("never reviews a standing fleet dispatch issue, however long it stays in progress", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000),
+      originKind: RECOVERY_ORIGIN_KINDS.fleetDispatch,
+    });
+    await insertRuns({ companyId: seeded.companyId, agentId: seeded.coderId, issueId: seeded.issueId, count: 12, now });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.scanned).toBe(0);
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {

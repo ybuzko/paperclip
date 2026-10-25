@@ -10,6 +10,38 @@ export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.00
 
 const CROSS_ISSUE_INFLUENCE_ACTIVITY = "issue.cross_issue_influence_observed";
 const CROSS_ISSUE_INFLUENCE_REJECTED_ACTIVITY = "issue.cross_issue_influence_cap_rejected";
+const AGENT_WRITE_WITHOUT_RUN_CONTEXT_ACTIVITY = "issue.agent_write_without_run_context";
+
+/**
+ * Operator switch for the run-context requirement on agent issue writes.
+ *
+ * `required` (default): every agent comment, issue update, and interaction
+ * card must carry a persisted heartbeat run bound to the agent and company,
+ * so the per-run cross-issue cap can be counted (SPEC §9.3).
+ *
+ * `optional`: an agent that authenticates with its long-lived agent key from
+ * outside a Paperclip-triggered run (a remote daemon, a manual CLI session,
+ * an operator-driven chat) may still write. There is no run to charge, so the
+ * write is audited as `issue.agent_write_without_run_context` instead of
+ * counted. Requests that *do* present a run id are validated and capped
+ * exactly as before, so a bogus header never buys more than no header.
+ */
+export const AGENT_ISSUE_WRITE_RUN_CONTEXT_ENV_KEY = "PAPERCLIP_AGENT_ISSUE_WRITE_RUN_CONTEXT";
+
+export type AgentIssueWriteRunContextPolicy = "required" | "optional";
+
+export function agentIssueWriteRunContextPolicy(
+  env: Record<string, string | undefined> = process.env,
+): AgentIssueWriteRunContextPolicy {
+  const raw = env[AGENT_ISSUE_WRITE_RUN_CONTEXT_ENV_KEY]?.trim().toLowerCase();
+  return raw === "optional" ? "optional" : "required";
+}
+
+export function agentIssueWriteRunContextOptional(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return agentIssueWriteRunContextPolicy(env) === "optional";
+}
 
 /**
  * Every kind shares one per-run counter. `interaction_resolution` covers the
@@ -78,8 +110,11 @@ export async function observeCrossIssueInfluence(
     targetIssueIdentifier?: string | null;
     kind: CrossIssueInfluenceKind;
     now?: Date;
+    /** Defaults to the process-wide `PAPERCLIP_AGENT_ISSUE_WRITE_RUN_CONTEXT` policy. */
+    runContextPolicy?: AgentIssueWriteRunContextPolicy;
   },
 ): Promise<CrossIssueInfluenceDecision | null> {
+  const runContextPolicy = input.runContextPolicy ?? agentIssueWriteRunContextPolicy();
   // API-key callers control the run header. Reject malformed UUIDs before the
   // database can turn an untrusted identifier into a PostgreSQL cast error.
   if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError();
@@ -110,7 +145,27 @@ export async function observeCrossIssueInfluence(
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    if (!sourceIssueId) {
+      // A real run of this agent with no issue in its context (manual wake,
+      // routine, chat) has nothing to contain against. Under the optional
+      // policy that is an uncounted write, not a refusal.
+      if (runContextPolicy === "optional") {
+        logger.info(
+          {
+            event: "cross_issue_influence_cap",
+            companyId: input.companyId,
+            runId: input.runId,
+            agentId: input.agentId,
+            targetIssueId: input.targetIssueId,
+            kind: input.kind,
+            policy: runContextPolicy,
+          },
+          "agent issue write from a run without a source issue allowed by optional run-context policy",
+        );
+        return null;
+      }
+      throw crossIssueInfluenceRunContextError();
+    }
     if (
       sourceIssueId === input.targetIssueId ||
       (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
@@ -176,6 +231,54 @@ export async function observeCrossIssueInfluence(
 
     return decision;
   });
+}
+
+/**
+ * Audits an agent issue write that arrived with no heartbeat run at all while
+ * the run-context policy is `optional`. Callers must check the policy first;
+ * this never decides, it only records so the activity stream still names who
+ * wrote to which issue from outside a run.
+ */
+export async function recordAgentIssueWriteWithoutRunContext(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    responsibleUserId?: string | null;
+    targetIssueId: string;
+    targetIssueIdentifier?: string | null;
+    kind: CrossIssueInfluenceKind;
+  },
+): Promise<void> {
+  await db.insert(activityLog).values({
+    companyId: input.companyId,
+    actorType: "agent",
+    actorId: input.agentId,
+    agentId: input.agentId,
+    runId: null,
+    responsibleUserId: input.responsibleUserId ?? null,
+    action: AGENT_WRITE_WITHOUT_RUN_CONTEXT_ACTIVITY,
+    entityType: "issue",
+    entityId: input.targetIssueId,
+    details: {
+      kind: input.kind,
+      targetIssueId: input.targetIssueId,
+      targetIssueIdentifier: input.targetIssueIdentifier ?? null,
+      policy: "optional" satisfies AgentIssueWriteRunContextPolicy,
+      envKey: AGENT_ISSUE_WRITE_RUN_CONTEXT_ENV_KEY,
+    },
+  });
+  logger.info(
+    {
+      event: "agent_issue_write_without_run_context",
+      companyId: input.companyId,
+      agentId: input.agentId,
+      targetIssueId: input.targetIssueId,
+      kind: input.kind,
+      policy: "optional",
+    },
+    "agent issue write without heartbeat run allowed by optional run-context policy",
+  );
 }
 
 export function crossIssueInfluenceLimitError(
