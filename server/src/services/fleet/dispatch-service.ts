@@ -25,6 +25,7 @@ import {
 } from "@paperclipai/db";
 import type { AgentEnvConfig } from "@paperclipai/shared";
 import { secretService } from "../secrets.js";
+import { RECOVERY_ORIGIN_KINDS } from "../recovery/origins.js";
 import { issueService } from "../issues.js";
 import {
   createJiraClient,
@@ -76,7 +77,7 @@ const DEFAULT_POLL_INTERVAL_MS = 10 * 60 * 1000;
  * (issue continuation, successful-run handoff, stranded-issue escalation) treat this
  * origin as externally managed and leave the issue alone; see recovery/origins.ts.
  */
-export const DISPATCH_ISSUE_ORIGIN_KIND = "fleet_dispatch";
+export const DISPATCH_ISSUE_ORIGIN_KIND: string = RECOVERY_ORIGIN_KINDS.fleetDispatch;
 
 /**
  * `fleet-ack:` line format the v2 nudge asks the supervisor to end its reply
