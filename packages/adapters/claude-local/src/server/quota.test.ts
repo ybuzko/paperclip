@@ -45,6 +45,28 @@ describe("fetchClaudeQuota scoped limits", () => {
     });
   });
 
+  it("reports the session window as 0% when the API returns five_hour: null (no open session)", async () => {
+    mockUsage({ ...typed, five_hour: null, limits: [
+      { kind: "weekly_all", group: "weekly", percent: 82, scope: null, is_active: true },
+    ] });
+    const windows = await fetchClaudeQuota("token");
+    expect(windows[0]).toEqual({
+      label: "Current session",
+      key: "five_hour",
+      usedPercent: 0,
+      resetsAt: null,
+      valueLabel: null,
+      detail: "No active session",
+    });
+    expect(windows[1]?.key).toBe("seven_day");
+  });
+
+  it("emits no session window when the whole body is empty", async () => {
+    mockUsage({ five_hour: null, seven_day: null });
+    const windows = await fetchClaudeQuota("token");
+    expect(windows.find((w) => w.key === "five_hour")).toBeUndefined();
+  });
+
   it("keeps the five typed windows unchanged when limits is missing or malformed", async () => {
     mockUsage(typed);
     const withoutLimits = await fetchClaudeQuota("token");

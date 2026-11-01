@@ -257,6 +257,19 @@ export async function fetchClaudeQuota(token: string): Promise<QuotaWindow[]> {
       valueLabel: null,
       detail: null,
     });
+  } else if (body.seven_day != null) {
+    // The usage API returns `five_hour: null` while no 5-hour session is
+    // open (nothing used recently). That is a real reading of 0%, not a
+    // sensing failure: without it the governor marks the account STALE,
+    // which holds all fleet work, which keeps the session closed forever.
+    windows.push({
+      label: "Current session",
+      key: CLAUDE_QUOTA_LABEL_TO_KEY["Current session"],
+      usedPercent: 0,
+      resetsAt: null,
+      valueLabel: null,
+      detail: "No active session",
+    });
   }
   if (body.seven_day != null) {
     windows.push({
