@@ -72,6 +72,7 @@ import { inboxDismissalRoutes } from "./routes/inbox-dismissals.js";
 import { instanceSettingsRoutes } from "./routes/instance-settings.js";
 import { fleetRoutes } from "./routes/fleet.js";
 import { fleetDispatchRoutes } from "./routes/fleet-dispatch.js";
+import { fleetHealthzRoutes } from "./routes/fleet-healthz.js";
 import { agentProvisioningRoutes } from "./routes/agent-provisioning.js";
 import { agentProvisioningSecretRoutes } from "./routes/agent-provisioning-secrets.js";
 import { instanceSettingsService } from "./services/instance-settings.js";
@@ -547,6 +548,7 @@ export async function createApp(
   api.use(instanceSettingsRoutes(db));
   api.use(fleetRoutes(db));
   api.use(fleetDispatchRoutes(db));
+  api.use(fleetHealthzRoutes(db));
   api.use(agentProvisioningRoutes(db));
   api.use(agentProvisioningSecretRoutes(db));
   if (opts.databaseBackupService) {
