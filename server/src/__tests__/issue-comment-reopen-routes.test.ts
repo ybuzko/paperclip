@@ -91,6 +91,8 @@ const mockExternalObjectService = vi.hoisted(() => ({
 const mockObserveCrossIssueInfluence = vi.hoisted(() => vi.fn());
 const mockCrossIssueInfluenceLimitError = vi.hoisted(() => vi.fn());
 const mockCrossIssueInfluenceRunContextError = vi.hoisted(() => vi.fn());
+const mockAgentIssueWriteRunContextOptional = vi.hoisted(() => vi.fn(() => false));
+const mockRecordAgentIssueWriteWithoutRunContext = vi.hoisted(() => vi.fn(async () => undefined));
 
 vi.mock("@paperclipai/shared/telemetry", () => ({
   trackAgentTaskCompleted: vi.fn(),
@@ -181,6 +183,8 @@ vi.mock("../services/cross-issue-influence-limit.js", () => ({
   observeCrossIssueInfluence: mockObserveCrossIssueInfluence,
   crossIssueInfluenceLimitError: mockCrossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError: mockCrossIssueInfluenceRunContextError,
+  agentIssueWriteRunContextOptional: mockAgentIssueWriteRunContextOptional,
+  recordAgentIssueWriteWithoutRunContext: mockRecordAgentIssueWriteWithoutRunContext,
 }));
 
 function createApp() {
@@ -2189,6 +2193,49 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["comment", (app: express.Express) => request(app)
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "cross-issue write" })],
+    ["update", (app: express.Express) => request(app)
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ title: "cross-issue write" })],
+  ] as const)(
+    "allows and audits an agent %s without a run header when the run-context policy is optional",
+    async (kind, sendRequest) => {
+      mockAgentIssueWriteRunContextOptional.mockReturnValue(true);
+      mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+      mockIssueService.getByIdForUpdate.mockResolvedValue(makeIssue("todo"));
+      mockIssueService.update.mockResolvedValue({ ...makeIssue("todo"), title: "cross-issue write" });
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-1",
+        issueId: "11111111-1111-4111-8111-111111111111",
+        body: "cross-issue write",
+        authorAgentId: "44444444-4444-4444-8444-444444444444",
+      });
+      const actor = { ...agentActor("44444444-4444-4444-8444-444444444444"), runId: undefined };
+      const res = await sendRequest(await installActor(createApp(), actor));
+
+      expect(res.status).toBe(kind === "comment" ? 201 : 200);
+      expect(mockCrossIssueInfluenceRunContextError).not.toHaveBeenCalled();
+      expect(mockObserveCrossIssueInfluence).not.toHaveBeenCalled();
+      expect(mockRecordAgentIssueWriteWithoutRunContext).toHaveBeenCalledTimes(1);
+      expect(mockRecordAgentIssueWriteWithoutRunContext).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          agentId: "44444444-4444-4444-8444-444444444444",
+          targetIssueId: "11111111-1111-4111-8111-111111111111",
+          kind,
+        }),
+      );
+      if (kind === "comment") {
+        expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+      } else {
+        expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+      }
+    },
+  );
 
   it.each(["invalid", "wrong agent", "wrong company"])(
     "rejects comment and PATCH writes with a %s run",

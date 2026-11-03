@@ -179,6 +179,20 @@ interface AnthropicUsageResponse {
   seven_day_sonnet?: AnthropicUsageWindow | null;
   seven_day_opus?: AnthropicUsageWindow | null;
   extra_usage?: AnthropicExtraUsage | null;
+  limits?: unknown;
+}
+
+function scopedLimitName(value: unknown): string | null {
+  const name = typeof value === "string"
+    ? value
+    : value !== null && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)["display_name"]
+      : null;
+  return typeof name === "string" && name.trim() ? name.trim() : null;
+}
+
+function scopedLimitSlug(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 }
 
 function formatCurrencyAmount(value: number, currency: string | null | undefined): string {
@@ -243,6 +257,19 @@ export async function fetchClaudeQuota(token: string): Promise<QuotaWindow[]> {
       valueLabel: null,
       detail: null,
     });
+  } else if (body.seven_day != null) {
+    // The usage API returns `five_hour: null` while no 5-hour session is
+    // open (nothing used recently). That is a real reading of 0%, not a
+    // sensing failure: without it the governor marks the account STALE,
+    // which holds all fleet work, which keeps the session closed forever.
+    windows.push({
+      label: "Current session",
+      key: CLAUDE_QUOTA_LABEL_TO_KEY["Current session"],
+      usedPercent: 0,
+      resetsAt: null,
+      valueLabel: null,
+      detail: "No active session",
+    });
   }
   if (body.seven_day != null) {
     windows.push({
@@ -289,6 +316,42 @@ export async function fetchClaudeQuota(token: string): Promise<QuotaWindow[]> {
           ? "Extra usage not enabled"
           : "Monthly extra usage pool",
     });
+  }
+  // The typed fields above remain authoritative when the API repeats a model
+  // in limits. Keep the original entry separately from human-facing detail.
+  if (Array.isArray(body.limits)) {
+    const seenKeys = new Set(windows.map((window) => window.key));
+    for (const entry of body.limits) {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const limit = entry as Record<string, unknown>;
+      if (limit["kind"] !== "weekly_scoped") continue;
+      const scope = limit["scope"];
+      if (scope === null || typeof scope !== "object" || Array.isArray(scope)) continue;
+      const scoped = scope as Record<string, unknown>;
+      const hasModel = scoped["model"] != null;
+      const name = scopedLimitName(hasModel ? scoped["model"] : scoped["surface"]);
+      if (name === null) continue;
+      const slug = scopedLimitSlug(name);
+      const percent = limit["percent"];
+      const reset = limit["resets_at"];
+      if (!slug || typeof percent !== "number" || !Number.isFinite(percent)
+        || percent < 0 || percent > 100
+        || (reset != null && typeof reset !== "string")) continue;
+      const typedKey = hasModel && (slug === "sonnet" || slug === "opus") ? `seven_day_${slug}` : null;
+      if (typedKey && seenKeys.has(typedKey)) continue;
+      const key = `seven_day_${hasModel ? "model" : "surface"}:${slug}`;
+      if (seenKeys.has(key)) continue;
+      windows.push({
+        label: `Current week (${name} only)`,
+        key,
+        usedPercent: percent,
+        resetsAt: reset ?? null,
+        valueLabel: null,
+        detail: null,
+        raw: limit,
+      });
+      seenKeys.add(key);
+    }
   }
   return windows;
 }

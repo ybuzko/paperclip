@@ -346,6 +346,8 @@ export interface QuotaWindow {
   valueLabel: string | null;
   /** optional supporting text, e.g. reset details or provider-specific notes */
   detail?: string | null;
+  /** original provider entry, when a window is derived from a scoped limit */
+  raw?: Record<string, unknown>;
 }
 
 /** result for one provider from getQuotaWindows() */

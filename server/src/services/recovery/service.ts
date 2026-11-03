@@ -3580,6 +3580,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.skipped += 1;
         continue;
       }
+      // The fleet dispatch loop's standing issue is in_progress by design and the
+      // loop wakes the supervisor itself (services/fleet/dispatch-service.ts); it is
+      // never stranded, so no continuation wake and no escalation.
+      if (issue.originKind === RECOVERY_ORIGIN_KINDS.fleetDispatch) {
+        result.skipped += 1;
+        continue;
+      }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
 

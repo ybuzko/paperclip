@@ -702,7 +702,7 @@ function hasCompleteAdapterConfig(adapterType: string, adapterConfig: unknown) {
   if (adapterType === "http") {
     return nonEmptyString(adapterConfig.url) || nonEmptyString(adapterConfig.endpoint) || nonEmptyString(adapterConfig.webhookUrl);
   }
-  if (adapterType === "openclaw_gateway" || adapterType === "hermes_gateway") {
+  if (adapterType === "openclaw_gateway" || adapterType === "hermes_gateway" || adapterType === "claudeclaw_gateway") {
     return nonEmptyString(adapterConfig.baseUrl) || nonEmptyString(adapterConfig.url);
   }
   return nonEmptyString(adapterConfig.model);

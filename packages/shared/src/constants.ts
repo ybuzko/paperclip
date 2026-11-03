@@ -40,6 +40,7 @@ export const AGENT_ADAPTER_TYPES = [
   "pi_local",
   "cursor",
   "openclaw_gateway",
+  "claudeclaw_gateway",
 ] as const;
 export type AgentAdapterType = (typeof AGENT_ADAPTER_TYPES)[number] | (string & {});
 
@@ -1001,6 +1002,9 @@ export type JoinRequestStatus = (typeof JOIN_REQUEST_STATUSES)[number];
 
 export const PERMISSION_KEYS = [
   "agents:create",
+  // Scoped, board-only grant: provision supervisor agents and their inject-token secrets
+  // (see server/src/services/agent-provisioning.ts).
+  "agents:provision",
   "agents:configure",
   "agents:suggest-changes",
   "skills:create",

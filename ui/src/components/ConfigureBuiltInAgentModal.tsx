@@ -25,7 +25,7 @@ import {
 
 /** Adapters whose config completeness is keyed on a non-empty `model`. */
 function isModelBasedAdapter(adapterType: string): boolean {
-  return !["process", "command", "http", "openclaw_gateway", "hermes_gateway"].includes(adapterType);
+  return !["process", "command", "http", "openclaw_gateway", "hermes_gateway", "claudeclaw_gateway"].includes(adapterType);
 }
 
 function defaultAdapterType(state: BuiltInAgentState): string {

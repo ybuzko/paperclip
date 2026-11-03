@@ -597,7 +597,14 @@ may wake the target assignee, including an explicit `resume: true` comment on a
 the normal agent rewake throttle; comment presentation cannot give it human
 wake privileges. Agent issue comments and updates require a persisted heartbeat
 run bound to the authenticated agent and company; missing, invalid, or mismatched
-run context fails closed before mutation. A run may attempt at most 20 cross-issue comments, issue
+run context fails closed before mutation. Operators who invite agents that legitimately act from
+outside Paperclip-triggered runs (remote daemons, manual CLI sessions, operator-driven chats) may
+set `PAPERCLIP_AGENT_ISSUE_WRITE_RUN_CONTEXT=optional` on the server: an agent key request with no
+run id, or a real run of that agent with no source issue, is then allowed as an audited
+`issue.agent_write_without_run_context` write instead of refused, and interaction cards may be
+created with a null source run. A presented run id is still validated and capped exactly as
+under the default `required` policy, and checkout, release, and recovery-action routes stay
+run-bound. A run may attempt at most 20 cross-issue comments, issue
 updates, or issue-thread interaction resolutions across one shared counter. The
 server records each attempt with its source issue, target issue, run, count, and
 rollout mode, and fails closed with the cap in the error once enforcement is

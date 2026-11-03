@@ -1,10 +1,14 @@
+import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  companies,
   createDb,
   fleetLimitSnapshots,
   fleetSettings,
   fleetThrottleStates,
   getEmbeddedPostgresTestSupport,
+  projects,
   startEmbeddedPostgresTestDatabase,
 } from "@paperclipai/db";
 import type { ProviderQuotaResult } from "@paperclipai/shared";
@@ -64,7 +68,35 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
     await db.delete(fleetThrottleStates);
     await db.delete(fleetLimitSnapshots);
     await db.delete(fleetSettings);
+    await db.delete(projects);
+    await db.delete(companies);
   });
+
+  async function seedCompany(): Promise<string> {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Admission Test Co",
+      status: "active",
+      issuePrefix: companyId.slice(0, 8),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return companyId;
+  }
+
+  async function seedProject(companyId: string, fleetClass: "P0" | "P1" | "P2"): Promise<string> {
+    const projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: `Project ${fleetClass}`,
+      env: { FLEET_CLASS: { type: "plain", value: fleetClass } },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return projectId;
+  }
 
   afterAll(async () => {
     await stopDb?.();
@@ -89,8 +121,73 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
       expect(byWindow.get("seven_day_sonnet")).toMatchObject({ usedPct: 5, ok: true });
       expect(byWindow.get("seven_day_opus")).toMatchObject({ usedPct: 91, ok: true });
       expect(byWindow.get("extra_usage")).toMatchObject({ usedPct: null, ok: true });
-      // The unmapped "Some future window" window is dropped, not written.
+      // An unkeyed window without a known label cannot be stored.
       expect(result.snapshots.some((row) => row.window === "Some future window")).toBe(false);
+    });
+
+    it("stores and groups a dynamic model-scoped Anthropic window", async () => {
+      const fableWindow = {
+        label: "Current week (Fable only)",
+        key: "seven_day_model:fable",
+        usedPercent: 87,
+        resetsAt: "2026-01-04T00:00:00.000Z",
+        valueLabel: null,
+      };
+      const surfaceWindow = {
+        label: "Current week (API surface only)",
+        key: "seven_day_surface:api",
+        usedPercent: 31,
+        resetsAt: "2026-01-03T00:00:00.000Z",
+        valueLabel: null,
+      };
+      const futureWindow = {
+        label: "Future keyed window",
+        key: "provider_future_window",
+        usedPercent: 22,
+        resetsAt: null,
+        valueLabel: null,
+      };
+      const svc = createFleetGovernorService({
+        db,
+        logger: fakeLogger(),
+        fetchQuota: async () => [{
+          ...OK_ANTHROPIC_WINDOWS_BY_KEY,
+          windows: [...OK_ANTHROPIC_WINDOWS_BY_KEY.windows, fableWindow, surfaceWindow, futureWindow],
+        }],
+        now: () => new Date("2026-01-02T00:00:00.000Z"),
+      });
+
+      const result = await svc.senseOnce();
+      const fable = result.snapshots.find((row) => row.window === "seven_day_model:fable");
+      expect(fable).toMatchObject({ provider: "anthropic", modelScope: "fable", usedPct: 87, ok: true });
+      expect(result.snapshots.find((row) => row.window === "seven_day_surface:api"))
+        .toMatchObject({ provider: "anthropic", modelScope: null, usedPct: 31, ok: true });
+
+      const status = await svc.getStatus();
+      expect(status.snapshots).toContainEqual(expect.objectContaining({
+        provider: "anthropic",
+        window: "seven_day_model:fable",
+        modelScope: "fable",
+        usedPct: 87,
+        resetsAt: new Date("2026-01-04T00:00:00.000Z"),
+        resetsAtPacific: "2026-01-03 16:00 PST",
+      }));
+      expect(status.providers.anthropic?.snapshots).toContainEqual(expect.objectContaining({
+        window: "seven_day_model:fable",
+        modelScope: "fable",
+        usedPct: 87,
+        resetsAt: new Date("2026-01-04T00:00:00.000Z"),
+      }));
+      expect(status.providers.anthropic?.snapshots).toContainEqual(expect.objectContaining({
+        window: "seven_day_surface:api",
+        modelScope: null,
+        usedPct: 31,
+      }));
+      expect(status.providers.anthropic?.snapshots).toContainEqual(expect.objectContaining({
+        window: "provider_future_window",
+        modelScope: null,
+        usedPct: 22,
+      }));
     });
 
     it("falls back to mapping by label when key is absent", async () => {
@@ -252,7 +349,7 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
 
       const result = await svc.evaluate();
       expect(result.decision.stale).toBe(true);
-      expect(result.decision.state).toBe("AMBER");
+      expect(result.decision.state).toBe("STALE");
     });
   });
 
@@ -268,7 +365,7 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
         },
         {
           key: GOVERNOR_PARAMS_SETTINGS_KEY,
-          value: { amberPace: 2.5 },
+          value: { amberPace: 2.5, capSchedules: { anthropic: { seven_day: { timeZone: "America/Los_Angeles", segments: [{ beforeResetHours: null, capPct: 65 }, { beforeResetHours: 10, capPct: 80 }, { beforeResetHours: 5, capPct: 99 }] } } } },
           version: "v1",
           updatedAt: new Date(),
           updatedBy: "test-admin",
@@ -287,10 +384,11 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
       const result = await svc.evaluate();
 
       expect(result.mode).toBe("enforce");
-      expect(result.params.amberPace).toBe(2.5);
+      expect(result.params.capSchedules.anthropic?.seven_day?.segments[0]?.capPct).toBe(65);
       // Unset fields still come from the defaults (deep-merge, not replace).
-      expect(result.params.redPace).toBe(DEFAULT_GOVERNOR_PARAMS.redPace);
-      expect(result.params.defaultModels).toEqual(DEFAULT_GOVERNOR_PARAMS.defaultModels);
+      expect(result.params.red5h).toBe(DEFAULT_GOVERNOR_PARAMS.red5h);
+      expect(result.params.capSchedules.anthropic?.seven_day?.segments).toHaveLength(3);
+      expect(Object.hasOwn(result.params, "amberPace")).toBe(false);
 
       const [persisted] = await db.select().from(fleetThrottleStates);
       expect(persisted?.mode).toBe("enforce");
@@ -315,6 +413,297 @@ describeEmbeddedPostgres("fleet governor service (embedded postgres)", () => {
       expect(status.snapshots.length).toBeGreaterThan(0);
       expect(status.snapshots.every((snapshot) => snapshot.stale === false)).toBe(true);
       expect(status.nextDueAt.getTime()).toBeGreaterThan(now.getTime());
+      expect(status.admissionsAllowed).toBe(0);
+      expect(status.admissionsBlocked).toBe(0);
+      expect(status.admissionsWouldBlock).toBe(0);
+      expect(status.lastBlock).toBeNull();
+    });
+
+    it("keeps provider snapshots and throttle decisions isolated", async () => {
+      const now = new Date("2026-01-02T00:00:00.000Z");
+      await db.insert(fleetSettings).values({
+        key: GOVERNOR_MODE_SETTINGS_KEY,
+        value: { mode: "enforce" },
+        version: "v1",
+        updatedAt: now,
+        updatedBy: "test-admin",
+      });
+      const fetchQuota = async () => [OK_ANTHROPIC_WINDOWS_BY_KEY];
+      const writer = createFleetGovernorService({ db, logger: fakeLogger(), fetchQuota, now: () => now });
+      await writer.senseOnce();
+      await writer.evaluate();
+
+      // A newer provider row for the same window must not replace Anthropic's
+      // quota snapshot or become the governor's active throttle decision.
+      await db.insert(fleetLimitSnapshots).values({
+        provider: "openai",
+        window: "five_hour",
+        usedPct: 99,
+        resetsAt: null,
+        source: "openai",
+        ok: true,
+        observedAt: new Date(now.getTime() + 1_000),
+      });
+      await db.insert(fleetThrottleStates).values({
+        provider: "openai",
+        ts: new Date(now.getTime() + 2_000),
+        mode: "enforce",
+        state: "RED",
+        reason: "unrelated provider state",
+        paramsVersion: "test",
+      });
+
+      const reader = createFleetGovernorService({ db, logger: fakeLogger(), fetchQuota, now: () => now });
+      const status = await reader.getStatus();
+      expect(status.snapshots).toEqual(expect.arrayContaining([
+        expect.objectContaining({ provider: "anthropic", window: "five_hour", usedPct: 12 }),
+        expect.objectContaining({ provider: "openai", window: "five_hour", usedPct: 99 }),
+      ]));
+      expect(status.providers.anthropic?.snapshots).toEqual(expect.arrayContaining([
+        expect.objectContaining({ window: "five_hour", usedPct: 12 }),
+      ]));
+      expect(status.providers.openai?.snapshots).toEqual(expect.arrayContaining([
+        expect.objectContaining({ window: "five_hour", usedPct: 99 }),
+      ]));
+      expect(status.latestDecision).toMatchObject({ provider: "anthropic" });
+
+      const admission = await reader.getAdmission({ companyId: "unused", agentId: "agent" });
+      expect(admission.state).toBe(status.latestDecision?.state);
+      expect(admission.allowed).toBe(true);
+    });
+  });
+
+  describe("getAdmission", () => {
+    const NOW = new Date("2026-01-02T00:00:00.000Z");
+
+    /** Quota windows with a reset far enough away to use the base cap. */
+    function quotaResult(opts: { fiveHourPct: number; sevenDayPct: number }): ProviderQuotaResult {
+      return {
+        provider: "anthropic",
+        source: "oauth_usage",
+        ok: true,
+        windows: [
+          { label: "Current session", key: "five_hour", usedPercent: opts.fiveHourPct, resetsAt: null, valueLabel: null, detail: null },
+          {
+            label: "Current week (all models)",
+            key: "seven_day",
+            usedPercent: opts.sevenDayPct,
+            resetsAt: "2026-01-05T12:00:00.000Z",
+            valueLabel: null,
+            detail: null,
+          },
+        ],
+      };
+    }
+
+    async function evaluatedService(opts: {
+      fiveHourPct: number;
+      sevenDayPct: number;
+      mode?: "shadow" | "enforce";
+    }) {
+      if (opts.mode) {
+        await db.insert(fleetSettings).values({
+          key: GOVERNOR_MODE_SETTINGS_KEY,
+          value: { mode: opts.mode },
+          version: "v1",
+          updatedAt: new Date(),
+          updatedBy: "test-admin",
+        });
+      }
+      const svc = createFleetGovernorService({
+        db,
+        logger: fakeLogger(),
+        fetchQuota: async () => [quotaResult(opts)],
+        now: () => NOW,
+      });
+      await svc.senseOnce();
+      await svc.evaluate();
+      return svc;
+    }
+
+    it("shadow mode: RED never blocks, but reports wouldBlock and the shadow reason", async () => {
+      const companyId = await seedCompany();
+      const svc = await evaluatedService({ fiveHourPct: 95, sevenDayPct: 40 }); // fresh 5h breach -> RED
+
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
+
+      expect(admission.state).toBe("RED");
+      expect(admission.mode).toBe("shadow");
+      expect(admission.allowed).toBe(true);
+      expect(admission.wouldBlock).toBe(true);
+      expect(admission.reason).toMatch(/^shadow: would block/);
+      expect(admission.reason).toMatch(/RED/);
+    });
+
+    it("enforce mode: RED blocks", async () => {
+      const companyId = await seedCompany();
+      const svc = await evaluatedService({ fiveHourPct: 95, sevenDayPct: 40, mode: "enforce" });
+
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
+
+      expect(admission.state).toBe("RED");
+      expect(admission.mode).toBe("enforce");
+      expect(admission.allowed).toBe(false);
+      expect(admission.wouldBlock).toBe(true);
+      expect(admission.reason).toMatch(/RED/);
+    });
+
+    it("enforce mode: a freshly evaluated STALE state blocks", async () => {
+      const companyId = await seedCompany();
+      await db.insert(fleetSettings).values({
+        key: GOVERNOR_MODE_SETTINGS_KEY, value: { mode: "enforce" }, version: "v1",
+        updatedAt: NOW, updatedBy: "test-admin",
+      });
+      await db.insert(fleetThrottleStates).values({
+        ts: NOW, mode: "enforce", state: "STALE", stale: true, pace: null,
+        fiveHourPct: 10, sevenDayPct: null, floorActive: false,
+        reason: "STALE: weekly snapshot missing", paramsVersion: DEFAULT_GOVERNOR_PARAMS.paramsVersion,
+        inputs: {}, launchParameters: {},
+      });
+      const svc = createFleetGovernorService({ db, logger: fakeLogger(), now: () => NOW });
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
+      expect(admission).toMatchObject({ state: "STALE", allowed: false, wouldBlock: true });
+    });
+
+    it("enforce mode: the interactive floor blocks even under OPEN", async () => {
+      const companyId = await seedCompany();
+      // 5h at 85% activates the floor while weekly usage remains below the cap.
+      const svc = await evaluatedService({ fiveHourPct: 85, sevenDayPct: 45, mode: "enforce" });
+
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
+
+      expect(admission.state).toBe("OPEN");
+      expect(admission.allowed).toBe(false);
+      expect(admission.reason).toMatch(/floor/i);
+    });
+
+    it("enforce mode: CAPPED blocks all project classes", async () => {
+      const companyId = await seedCompany();
+      const p0 = await seedProject(companyId, "P0");
+      const p1 = await seedProject(companyId, "P1");
+      const p2 = await seedProject(companyId, "P2");
+      // Weekly usage 75% exceeds the default 70% cap.
+      const svc = await evaluatedService({ fiveHourPct: 40, sevenDayPct: 75, mode: "enforce" });
+
+      const admissionP0 = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: p0 });
+      const admissionP1 = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: p1 });
+      const admissionP2 = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: p2 });
+
+      expect(admissionP0.state).toBe("CAPPED");
+      expect(admissionP0.projectClass).toBe("P0");
+      expect(admissionP0.allowed).toBe(false);
+
+      expect(admissionP1.projectClass).toBe("P1");
+      expect(admissionP1.allowed).toBe(false);
+
+      expect(admissionP2.projectClass).toBe("P2");
+      expect(admissionP2.allowed).toBe(false);
+      expect(admissionP2.reason).toMatch(/CAPPED/);
+    });
+
+    it("a project with no FLEET_CLASS set, or no projectId at all, defaults to P2", async () => {
+      const companyId = await seedCompany();
+      const untaggedProject = await seedProject(companyId, "P0");
+      // Overwrite env to omit FLEET_CLASS entirely.
+      await db.update(projects).set({ env: {} }).where(eq(projects.id, untaggedProject));
+      const svc = await evaluatedService({ fiveHourPct: 40, sevenDayPct: 50 }); // OPEN
+
+      const noProject = await svc.getAdmission({ companyId, agentId: "agent-1" });
+      const untagged = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: untaggedProject });
+
+      expect(noProject.projectClass).toBe("P2");
+      expect(untagged.projectClass).toBe("P2");
+    });
+
+    it("OPEN allows regardless of project class", async () => {
+      const companyId = await seedCompany();
+      const p2 = await seedProject(companyId, "P2");
+      const svc = await evaluatedService({ fiveHourPct: 40, sevenDayPct: 45, mode: "enforce" }); // OPEN
+
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1", projectId: p2 });
+
+      expect(admission.state).toBe("OPEN");
+      expect(admission.allowed).toBe(true);
+      expect(admission.wouldBlock).toBe(false);
+    });
+
+    it("no decision yet (nothing sensed/evaluated) is stale and blocks in enforce mode", async () => {
+      const companyId = await seedCompany();
+      await db.insert(fleetSettings).values({
+        key: GOVERNOR_MODE_SETTINGS_KEY,
+        value: { mode: "enforce" },
+        version: "v1",
+        updatedAt: new Date(),
+        updatedBy: "test-admin",
+      });
+      const svc = createFleetGovernorService({ db, logger: fakeLogger(), now: () => NOW });
+
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
+
+      expect(admission.state).toBeNull();
+      expect(admission.stale).toBe(true);
+      expect(admission.allowed).toBe(false);
+      expect(admission.reason).toMatch(/stale/i);
+    });
+
+    it("falls back to the newest fleet_throttle_states row when there is no in-memory decision", async () => {
+      const companyId = await seedCompany();
+      await db.insert(fleetThrottleStates).values({
+        ts: NOW,
+        mode: "shadow",
+        state: "OPEN",
+        stale: false,
+        pace: 1.0,
+        fiveHourPct: 10,
+        sevenDayPct: 50,
+        floorActive: false,
+        reason: "OPEN: seeded row for DB-fallback test",
+        paramsVersion: DEFAULT_GOVERNOR_PARAMS.paramsVersion,
+        inputs: {},
+        launchParameters: {},
+      });
+      // Freshly constructed service: no senseOnce()/evaluate() call, so
+      // getAdmission() must fall back to the DB row above.
+      const svc = createFleetGovernorService({ db, logger: fakeLogger(), now: () => NOW });
+
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
+
+      expect(admission.state).toBe("OPEN");
+      expect(admission.stale).toBe(false);
+      expect(admission.allowed).toBe(true);
+    });
+
+    it("a decision older than staleAfterMs is treated as stale even when cached in-memory", async () => {
+      const companyId = await seedCompany();
+      let clock = NOW;
+      const svc = createFleetGovernorService({
+        db,
+        logger: fakeLogger(),
+        fetchQuota: async () => [quotaResult({ fiveHourPct: 40, sevenDayPct: 40 })],
+        now: () => clock,
+      });
+      await svc.senseOnce();
+      await svc.evaluate();
+
+      clock = new Date(NOW.getTime() + DEFAULT_GOVERNOR_PARAMS.staleAfterMs + 1);
+      const admission = await svc.getAdmission({ companyId, agentId: "agent-1" });
+
+      expect(admission.stale).toBe(true);
+      expect(admission.reason).toMatch(/stale/i);
+    });
+
+    it("updates getStatus() admission counters and lastBlock", async () => {
+      const companyId = await seedCompany();
+      const svc = await evaluatedService({ fiveHourPct: 95, sevenDayPct: 40, mode: "enforce" }); // RED
+
+      await svc.getAdmission({ companyId, agentId: "agent-allowed-would-not-apply" }); // blocked (RED)
+      await svc.getAdmission({ companyId, agentId: "agent-2" }); // blocked (RED)
+
+      const status = await svc.getStatus();
+      expect(status.admissionsBlocked).toBe(2);
+      expect(status.admissionsAllowed).toBe(0);
+      expect(status.lastBlock).toMatchObject({ agentId: "agent-2" });
+      expect(status.lastBlock?.reason).toMatch(/RED/);
     });
   });
 });

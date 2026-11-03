@@ -23,6 +23,17 @@ import {
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
+/**
+ * Origin kinds whose issues are never productivity-review candidates. Standing
+ * fleet dispatch issues (one per Jira project, see services/fleet/dispatch-service.ts)
+ * are permanently in_progress by design, so "long active duration" is their normal
+ * state and reviewing them only wakes the assignee for nothing. Matching on
+ * origin_kind covers every current and future standing issue.
+ */
+export const PRODUCTIVITY_REVIEW_EXEMPT_ORIGIN_KINDS: readonly string[] = [
+  PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+  RECOVERY_ORIGIN_KINDS.fleetDispatch,
+];
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS = 6;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY = 10;
@@ -856,7 +867,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           isNull(issues.assigneeUserId),
           inArray(issues.status, ["todo", "in_progress"]),
           sql`${issues.assigneeAgentId} is not null`,
-          sql`${issues.originKind} <> ${PRODUCTIVITY_REVIEW_ORIGIN_KIND}`,
+          notInArray(issues.originKind, [...PRODUCTIVITY_REVIEW_EXEMPT_ORIGIN_KINDS]),
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
       )

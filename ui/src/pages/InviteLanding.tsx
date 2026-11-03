@@ -21,6 +21,7 @@ type AuthFeedback = { tone: "error" | "info"; message: string };
 const joinAdapterOptions: AgentAdapterType[] = [...AGENT_ADAPTER_TYPES];
 const ENABLED_INVITE_ADAPTERS = new Set([
   "claude_local",
+  "claudeclaw_gateway",
   "codex_local",
   "gemini_local",
   "kimi_local",

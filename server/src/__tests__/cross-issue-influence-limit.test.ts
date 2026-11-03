@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  AGENT_ISSUE_WRITE_RUN_CONTEXT_ENV_KEY,
   CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
   CROSS_ISSUE_INFLUENCE_LIMIT,
+  agentIssueWriteRunContextOptional,
+  agentIssueWriteRunContextPolicy,
   crossIssueInfluenceLimitError,
   evaluateCrossIssueInfluenceLimit,
   observeCrossIssueInfluence,
+  recordAgentIssueWriteWithoutRunContext,
 } from "../services/cross-issue-influence-limit.ts";
 
 function counterDb(
@@ -207,10 +211,114 @@ describe("cross-issue influence limit rollout", () => {
       agentId: "33333333-3333-4333-8333-333333333333",
       targetIssueId: "55555555-5555-4555-8555-555555555555",
       kind: "update",
+      runContextPolicy: "required",
     })).rejects.toMatchObject({
       status: 403,
       details: { code: "cross_issue_influence_run_context_required" },
     });
     expect(fake.inserted).toEqual([]);
+  });
+});
+
+describe("agent issue write run-context policy", () => {
+  it("defaults to required and only recognises the explicit optional value", () => {
+    expect(agentIssueWriteRunContextPolicy({})).toBe("required");
+    expect(agentIssueWriteRunContextPolicy({ [AGENT_ISSUE_WRITE_RUN_CONTEXT_ENV_KEY]: "" })).toBe("required");
+    expect(agentIssueWriteRunContextPolicy({ [AGENT_ISSUE_WRITE_RUN_CONTEXT_ENV_KEY]: "true" })).toBe("required");
+    expect(agentIssueWriteRunContextPolicy({ [AGENT_ISSUE_WRITE_RUN_CONTEXT_ENV_KEY]: "off" })).toBe("required");
+    expect(agentIssueWriteRunContextPolicy({ [AGENT_ISSUE_WRITE_RUN_CONTEXT_ENV_KEY]: "optional" })).toBe("optional");
+    expect(agentIssueWriteRunContextPolicy({ [AGENT_ISSUE_WRITE_RUN_CONTEXT_ENV_KEY]: " Optional " })).toBe("optional");
+    expect(agentIssueWriteRunContextOptional({ [AGENT_ISSUE_WRITE_RUN_CONTEXT_ENV_KEY]: "optional" })).toBe(true);
+    expect(agentIssueWriteRunContextOptional({})).toBe(false);
+  });
+
+  it("allows an uncounted write from a run without a source issue under the optional policy", async () => {
+    const fake = counterDb(0, { contextSnapshot: {} });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "update",
+      runContextPolicy: "optional",
+    })).resolves.toBeNull();
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it.each([
+    ["missing", null],
+    ["wrong-agent", { agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }],
+    ["wrong-company", { companyId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }],
+  ] as const)("still fails closed for a %s run under the optional policy", async (_label, runOverrides) => {
+    const fake = counterDb(0, runOverrides);
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+      runContextPolicy: "optional",
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "cross_issue_influence_run_context_required" },
+    });
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it("still counts and caps cross-issue writes from a real run under the optional policy", async () => {
+    const fake = counterDb(CROSS_ISSUE_INFLUENCE_LIMIT);
+
+    const decision = await observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+      now: new Date(CROSS_ISSUE_INFLUENCE_ENFORCE_AT.getTime() + 1),
+      runContextPolicy: "optional",
+    });
+    expect(decision).toMatchObject({ allowed: false, mode: "enforce", count: CROSS_ISSUE_INFLUENCE_LIMIT + 1 });
+    expect(fake.inserted.map((row) => row.action)).toEqual(["issue.cross_issue_influence_cap_rejected"]);
+  });
+
+  it("audits a write that arrives with no run at all", async () => {
+    const inserted: Array<Record<string, unknown>> = [];
+    const db = {
+      insert: () => ({
+        values: async (value: Record<string, unknown>) => {
+          inserted.push(value);
+        },
+      }),
+    };
+
+    await recordAgentIssueWriteWithoutRunContext(db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      responsibleUserId: "user-1",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      targetIssueIdentifier: "PIX-7",
+      kind: "comment",
+    });
+
+    expect(inserted).toEqual([
+      expect.objectContaining({
+        action: "issue.agent_write_without_run_context",
+        actorType: "agent",
+        actorId: "33333333-3333-4333-8333-333333333333",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        runId: null,
+        responsibleUserId: "user-1",
+        entityType: "issue",
+        entityId: "55555555-5555-4555-8555-555555555555",
+        details: expect.objectContaining({
+          kind: "comment",
+          targetIssueIdentifier: "PIX-7",
+          policy: "optional",
+          envKey: AGENT_ISSUE_WRITE_RUN_CONTEXT_ENV_KEY,
+        }),
+      }),
+    ]);
   });
 });

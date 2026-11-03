@@ -53,6 +53,16 @@ export {
 } from "./fleet.js";
 
 export {
+  dispatchParamsPatchSchema,
+  dispatchModeSchema,
+  dispatchJiraSettingsSchema,
+  patchFleetDispatchSettingsSchema,
+  type DispatchParamsPatch,
+  type DispatchJiraSettings,
+  type PatchFleetDispatchSettings,
+} from "./fleet-dispatch.js";
+
+export {
   upsertBudgetPolicySchema,
   resolveBudgetIncidentSchema,
   type UpsertBudgetPolicy,
@@ -954,3 +964,16 @@ export {
 } from "./tool-access.js";
 export * from "./skill-policy.js";
 export * from "./app-definition.js";
+
+export {
+  agentProvisionGrantScopeSchema,
+  setAgentProvisionGrantSchema,
+  provisionAgentSchema,
+  provisionSecretSchema,
+  bindProvisionedSecretSchema,
+  type AgentProvisionGrantScope,
+  type SetAgentProvisionGrant,
+  type ProvisionAgent,
+  type ProvisionSecret,
+  type BindProvisionedSecret,
+} from "./agent-provisioning.js";

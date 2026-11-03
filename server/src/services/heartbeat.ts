@@ -101,11 +101,13 @@ import type {
 } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
+import { buildAdapterProjectContext } from "./heartbeat-project-context.js";
 import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
+import { getSharedFleetGovernorService } from "./fleet/governor-service.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
@@ -859,6 +861,13 @@ const activeRunExecutionPromises = new Set<Promise<void>>();
 // can await a wake that is still before run registration. A caller that tears
 // down a shared database (a test afterEach) then cannot race a late wake.
 const activeWakeupPromises = new Set<Promise<unknown>>();
+// claimQueuedRun() re-checks fleet governor admission on every scheduling
+// pass while a run sits queued (it does not cancel the run — it just leaves
+// it queued for the governor to open later). That would otherwise log once
+// per pass; this map — shared across service instances like the sets above —
+// rate-limits the log to once per run per distinct reason. Cleared when the
+// run is claimed (admitted) or cancelled for some other reason.
+const lastFleetAdmissionHoldReasonByRunId = new Map<string, string>();
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 type RuntimeConfigSecretResolver = Pick<
   ReturnType<typeof secretService>,
@@ -10905,6 +10914,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "agent_not_invokable"
           | "heartbeat_wake_on_demand_disabled"
           | "budget_blocked"
+          | "fleet_throttled"
           | "issue_not_found"
           | "issue_reassigned"
           | "issue_cancelled"
@@ -10948,6 +10958,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           scopeId: budgetBlock.scopeId,
         },
       };
+    }
+
+    try {
+      const admission = await getSharedFleetGovernorService({ db, logger }).getAdmission({
+        companyId: run.companyId,
+        agentId: run.agentId,
+        projectId,
+      });
+      if (!admission.allowed) {
+        // Mirrors the budget_blocked branch above: a blocked scheduled retry
+        // is cancelled by the caller (cancelScheduledRetryForGate), not held
+        // and retried later — the run's execution lock is released, so the
+        // issue remains workable and can be picked back up by a fresh wake.
+        return {
+          allowed: false,
+          reason: admission.reason,
+          errorCode: "fleet_throttled",
+          issueId,
+          details: {
+            state: admission.state,
+            stale: admission.stale,
+            projectClass: admission.projectClass,
+          },
+        };
+      }
+    } catch (err) {
+      // Fail open: never let a fleet-governor error suppress a scheduled retry.
+      logger.error(
+        { err, runId: run.id, agentId: run.agentId },
+        "heartbeat: fleet governor admission check failed during scheduled retry gate; allowing retry to proceed",
+      );
     }
 
     const agentInvokability = await getAgentInvokability(agent);
@@ -12665,8 +12706,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       projectId: readNonEmptyString(context.projectId),
     });
     if (budgetBlock) {
+      lastFleetAdmissionHoldReasonByRunId.delete(run.id);
       await cancelRunInternal(run.id, budgetBlock.reason);
       return null;
+    }
+
+    try {
+      const admission = await getSharedFleetGovernorService({ db, logger }).getAdmission({
+        companyId: run.companyId,
+        agentId: run.agentId,
+        projectId: readNonEmptyString(context.projectId),
+      });
+      if (!admission.allowed) {
+        // Hold, don't cancel: leave the run queued so a later scheduling pass
+        // (startNextQueuedRunForAgent / executeRun) retries it once the
+        // governor opens up. Rate-limit the log to once per run per distinct
+        // reason so a run held across many passes doesn't spam info logs.
+        if (lastFleetAdmissionHoldReasonByRunId.get(run.id) !== admission.reason) {
+          lastFleetAdmissionHoldReasonByRunId.set(run.id, admission.reason);
+          logger.info(
+            {
+              runId: run.id,
+              agentId: run.agentId,
+              companyId: run.companyId,
+              state: admission.state,
+              reason: admission.reason,
+            },
+            "heartbeat: run held queued by fleet governor admission",
+          );
+        }
+        return null;
+      }
+      lastFleetAdmissionHoldReasonByRunId.delete(run.id);
+    } catch (err) {
+      // Fail open: never let a fleet-governor error block the scheduler.
+      logger.error(
+        { err, runId: run.id, agentId: run.agentId },
+        "heartbeat: fleet governor admission check failed; allowing run to proceed",
+      );
     }
 
     const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, parseHeartbeatPolicy(agent), {
@@ -14265,6 +14342,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ? await db
           .select({
             id: projects.id,
+            name: projects.name,
             executionWorkspacePolicy: projects.executionWorkspacePolicy,
             env: projects.env,
             updatedAt: projects.updatedAt,
@@ -16263,6 +16341,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
         } else {
           const adapterContext = { ...context };
+          // Gateway adapters never see the resolved run env, so hand them the
+          // project identity and the project's plain (non-secret) env values.
+          // Secret-backed bindings stay out of the context on purpose.
+          const adapterProjectContext = buildAdapterProjectContext(projectContext);
+          if (adapterProjectContext) {
+            adapterContext.projectId = adapterProjectContext.projectId;
+            adapterContext.projectName = adapterProjectContext.projectName;
+            adapterContext.projectEnv = adapterProjectContext.projectEnv;
+          }
           const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
             db,
             agent,
@@ -17703,6 +17790,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+        return { kind: "released" as const };
+      }
+
+      // The fleet dispatch loop's standing issue stays in_progress on purpose; the loop
+      // re-polls Jira and wakes the supervisor itself. Never queue continuation recovery
+      // or block it as stranded.
+      if (issue.originKind === RECOVERY_ORIGIN_KINDS.fleetDispatch) {
         return { kind: "released" as const };
       }
 

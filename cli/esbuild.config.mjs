@@ -22,6 +22,7 @@ const workspacePaths = [
   "packages/shared",
   "packages/adapter-utils",
   "packages/adapters/claude-local",
+  "packages/adapters/claudeclaw-gateway",
   "packages/adapters/codex-local",
   "packages/adapters/hermes-gateway",
   "packages/adapters/hermes",
