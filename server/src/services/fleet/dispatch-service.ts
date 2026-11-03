@@ -48,6 +48,7 @@ import {
   epicsToExplodeJql,
   isJiraIssueKey,
   parseFleetAck,
+  partitionBlocked,
   readyTasksJql,
   selectAssignment,
   unfinishedChildrenJql,
@@ -293,6 +294,8 @@ export interface DispatchDecisionRecord extends DecideDispatchResult {
   pendingIssue?: { id: string; identifier: string | null } | null;
   /** The last wake sent for a pending Paperclip issue; carried forward. */
   pendingIssueWake?: { issueId: string; identifier: string | null; at: string; runId: string | null } | null;
+  /** Tasks assigned to the supervisor that were excluded from ready work as blocked this tick. */
+  blockedKeys?: string[];
 }
 
 /** The `context.fleetDispatch` payload, version 2 (see the claudeclaw_gateway adapter). */
@@ -834,16 +837,20 @@ export function createFleetDispatchService(deps: FleetDispatchServiceDeps): Flee
     jira: JiraClient,
     project: EligibleProject,
     excludeKeys: ReadonlySet<string>,
-  ): Promise<{ counts: ReadyWorkCounts; assignment: DispatchAssignment | null }> {
+  ): Promise<{ counts: ReadyWorkCounts; assignment: DispatchAssignment | null; blockedKeys: string[] }> {
     const accountId = project.jiraAccountId;
     const notExcluded = (issue: JiraIssueDetail) => !excludeKeys.has(issue.key);
-    const [tasks, epicsToExplode, closeCandidates] = await Promise.all([
+    const [allTasks, epicsToExplode, closeCandidates] = await Promise.all([
       jira.searchIssues(
         readyTasksJql({ jiraProject: project.jiraProject, jiraAccountId: accountId, readyStatuses: project.readyStatuses }),
       ),
       jira.searchIssues(epicsToExplodeJql({ jiraProject: project.jiraProject, jiraAccountId: accountId })),
       jira.searchIssues(epicsToCloseCandidateJql({ jiraProject: project.jiraProject, jiraAccountId: accountId })),
     ]).then(([t, e, c]) => [t.filter(notExcluded), e.filter(notExcluded), c.filter(notExcluded)] as const);
+    // Blocked tickets (unresolved "is blocked by" link, or the `blocked` label)
+    // are not ready work: nudging one only produces a decline and a hand-off to
+    // the human. They stay with the supervisor and re-enter as blockers resolve.
+    const { workable: tasks, blocked } = partitionBlocked(allTasks);
 
     const candidateKeys = closeCandidates.map((issue) => issue.key);
     let epicsToCloseKeys: string[] = [];
@@ -870,6 +877,7 @@ export function createFleetDispatchService(deps: FleetDispatchServiceDeps): Flee
         epicKeysToClose: epicsToCloseKeys.slice(0, 20),
       },
       assignment,
+      blockedKeys: blocked.map((issue) => issue.key),
     };
   }
 
@@ -1005,8 +1013,9 @@ export function createFleetDispatchService(deps: FleetDispatchServiceDeps): Flee
     // 2. Ready work + the ONE selected item.
     let counts: ReadyWorkCounts;
     let assignment: DispatchAssignment | null;
+    let blockedKeys: string[];
     try {
-      ({ counts, assignment } = await fetchReadyWork(jira, project, excludeKeys));
+      ({ counts, assignment, blockedKeys } = await fetchReadyWork(jira, project, excludeKeys));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const kind =
@@ -1100,6 +1109,7 @@ export function createFleetDispatchService(deps: FleetDispatchServiceDeps): Flee
         governor: governorInput,
         projectClass: project.projectClass,
         counts,
+        blockedTasks: blockedKeys.length,
         agentBusy,
         lastNudgeAt: existing?.lastNudgeAt ?? null,
         backoffLevel: existing?.backoffLevel ?? 0,
@@ -1148,6 +1158,7 @@ export function createFleetDispatchService(deps: FleetDispatchServiceDeps): Flee
             agentId: project.leadAgentId,
             reason: decision.reason,
             assignment: assignment?.key ?? null,
+            blockedKeys,
           },
           "fleet dispatch: nudged supervisor",
         );
@@ -1166,6 +1177,7 @@ export function createFleetDispatchService(deps: FleetDispatchServiceDeps): Flee
       nudgedAssignment,
       pendingIssue,
       pendingIssueWake,
+      blockedKeys,
     };
 
     await persistState({

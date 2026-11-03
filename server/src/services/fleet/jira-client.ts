@@ -40,6 +40,49 @@ export interface JiraIssueDetail extends JiraIssueSummary {
   created: string | null;
   /** ISO-8601 timestamp string as Jira returns it, or null. */
   updated: string | null;
+  /** Jira labels, as returned (case preserved). */
+  labels: string[];
+  /**
+   * Keys of issues this one "is blocked by" (inward side of a Blocks-type
+   * link) whose status is not resolved yet. Empty when nothing blocks it.
+   */
+  openBlockers: string[];
+}
+
+/**
+ * Names that mean "finished" regardless of the status category. Needed because
+ * some workflows in this Jira put their "Done" status in the `indeterminate`
+ * category, so `statusCategory = Done` misses them.
+ */
+const RESOLVED_STATUS_NAMES = new Set(["done", "closed", "resolved", "won't do", "wont do", "cancelled", "canceled", "duplicate"]);
+
+/** True when a linked issue's status means it no longer blocks anything. */
+export function isResolvedJiraStatus(statusName: string | null | undefined, statusCategoryKey: string | null | undefined): boolean {
+  if (statusCategoryKey === "done") return true;
+  return RESOLVED_STATUS_NAMES.has((statusName ?? "").trim().toLowerCase());
+}
+
+type RawIssueLink = {
+  type?: { name?: string | null; inward?: string | null } | null;
+  inwardIssue?: {
+    key?: string | null;
+    fields?: { status?: { name?: string | null; statusCategory?: { key?: string | null } | null } | null } | null;
+  } | null;
+};
+
+/** Keys of unresolved issues on the inward ("is blocked by") side of Blocks links. */
+export function openBlockersFromLinks(links: readonly RawIssueLink[] | null | undefined): string[] {
+  const keys: string[] = [];
+  for (const link of links ?? []) {
+    const inwardLabel = (link?.type?.inward ?? "").toLowerCase();
+    const typeName = (link?.type?.name ?? "").toLowerCase();
+    if (!inwardLabel.includes("blocked by") && typeName !== "blocks") continue;
+    const inward = link?.inwardIssue;
+    if (!inward?.key) continue;
+    if (isResolvedJiraStatus(inward.fields?.status?.name, inward.fields?.status?.statusCategory?.key)) continue;
+    keys.push(inward.key);
+  }
+  return keys;
 }
 
 /** `GET /rest/api/3/issue/{key}` result: the key plus the raw requested fields. */
@@ -104,7 +147,7 @@ export class JiraRequestError extends Error {
 }
 
 const DEFAULT_SEARCH_FIELDS = ["key", "issuetype", "status", "parent"] as const;
-const DEFAULT_DETAIL_FIELDS = ["key", "summary", "status", "issuetype", "created", "updated", "parent"] as const;
+const DEFAULT_DETAIL_FIELDS = ["key", "summary", "status", "issuetype", "created", "updated", "parent", "labels", "issuelinks"] as const;
 
 function joinUrl(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/+$/, "")}${path}`;
@@ -232,6 +275,8 @@ export function createJiraClient(config: JiraClientConfig): JiraClient {
             issuetype?: { name?: string | null } | null;
             status?: { name?: string | null; statusCategory?: { key?: string | null } | null } | null;
             parent?: { key?: string | null } | null;
+            labels?: unknown;
+            issuelinks?: unknown;
           } | null;
         }>;
         isLast?: boolean;
@@ -248,6 +293,12 @@ export function createJiraClient(config: JiraClientConfig): JiraClient {
           summary: typeof issue.fields?.summary === "string" ? issue.fields.summary : null,
           created: typeof issue.fields?.created === "string" ? issue.fields.created : null,
           updated: typeof issue.fields?.updated === "string" ? issue.fields.updated : null,
+          labels: Array.isArray(issue.fields?.labels)
+            ? issue.fields.labels.filter((label): label is string => typeof label === "string")
+            : [],
+          openBlockers: Array.isArray(issue.fields?.issuelinks)
+            ? openBlockersFromLinks(issue.fields.issuelinks as RawIssueLink[])
+            : [],
         });
       }
 

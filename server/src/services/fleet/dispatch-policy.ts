@@ -170,6 +170,32 @@ export interface ReadyIssueCandidate {
   statusName: string | null;
   created: string | null;
   updated: string | null;
+  /** Jira labels; a `blocked` label (any case) marks the ticket as not workable. */
+  labels?: readonly string[];
+  /** Keys of unresolved "is blocked by" issues (see jira-client.ts `openBlockersFromLinks`). */
+  openBlockers?: readonly string[];
+}
+
+/** Label that marks a ticket as not workable regardless of links. */
+export const BLOCKED_LABEL = "blocked";
+
+/**
+ * A ticket is blocked when an unresolved issue blocks it or it carries the
+ * `blocked` label. Blocked tickets are never selected for a nudge: sending
+ * one only makes the supervisor decline it, and a decline hands the ticket
+ * to the human, who then holds work that needs nobody.
+ */
+export function isBlockedCandidate(candidate: Pick<ReadyIssueCandidate, "labels" | "openBlockers">): boolean {
+  if ((candidate.openBlockers?.length ?? 0) > 0) return true;
+  return (candidate.labels ?? []).some((label) => label.trim().toLowerCase() === BLOCKED_LABEL);
+}
+
+/** Splits candidates into workable and blocked, preserving order. */
+export function partitionBlocked<T extends ReadyIssueCandidate>(candidates: readonly T[]): { workable: T[]; blocked: T[] } {
+  const workable: T[] = [];
+  const blocked: T[] = [];
+  for (const candidate of candidates) (isBlockedCandidate(candidate) ? blocked : workable).push(candidate);
+  return { workable, blocked };
 }
 
 /** The ONE item a v2 nudge is about. */
@@ -300,6 +326,8 @@ export interface DecideDispatchInput {
   governor: DispatchGovernorInput;
   projectClass: ProjectClass;
   counts: Pick<ReadyWorkCounts, "readyTasks" | "epicsToExplode" | "epicsToClose">;
+  /** Tasks assigned to the supervisor that were excluded as blocked (for the no-work reason only). */
+  blockedTasks?: number;
   /** True when the agent already has a queued or running heartbeat run. */
   agentBusy: boolean;
   lastNudgeAt: Date | null;
@@ -365,7 +393,11 @@ export function decideDispatch(input: DecideDispatchInput): DecideDispatchResult
   let nextBackoffLevel = lastNudgeAt != null && !stuck ? 0 : input.backoffLevel;
 
   if (!hasWork) {
-    return { nudge: false, reason: "no_work: no ready tasks, epics to explode, or epics to close", nextBackoffLevel };
+    const blocked = input.blockedTasks ?? 0;
+    const reason = blocked > 0
+      ? `no_work: no workable tasks, epics to explode, or epics to close (${blocked} assigned task${blocked === 1 ? "" : "s"} blocked)`
+      : "no_work: no ready tasks, epics to explode, or epics to close";
+    return { nudge: false, reason, nextBackoffLevel };
   }
 
   if (input.agentBusy) {

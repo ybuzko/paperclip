@@ -49,8 +49,25 @@ with no children at all — `dispatch-policy.ts`'s `computeEpicsToClose()`).
 itself is the full (uncapped) count.
 
 All three lists are fetched with `GET /rest/api/3/search/jql` and fields
-`key,summary,status,issuetype,created,updated,parent`; the counts are the
-list lengths.
+`key,summary,status,issuetype,created,updated,parent,labels,issuelinks`.
+
+**Blocked tasks are not ready work.** A task is blocked when it has an
+unresolved issue on the inward side of a `Blocks` link ("is blocked by"), or
+carries the `blocked` label (any case). `dispatch-policy.ts`
+`partitionBlocked()` removes them before counting and before selection, so
+`readyTasks` is the number of *workable* tasks. Blocked tasks stay assigned to
+the supervisor and re-enter automatically when their blockers resolve. The
+`no_work` reason reports how many were excluded, and a nudge's log line lists
+them as `blockedKeys`. A linked issue counts as resolved when its status
+category is `done` **or** its status name is Done/Closed/Resolved/Won't Do/
+Cancelled/Duplicate, because several workflows in this Jira keep their "Done"
+status in the `indeterminate` category (`jira-client.ts` `isResolvedJiraStatus()`).
+
+Why: nudging a blocked ticket only makes the supervisor decline it, and a
+decline reassigns the ticket to the human (see "Decline"), who then holds
+tickets that need nobody. On 2026-11-02 seven SEEN tickets ended up that way.
+
+The epic and epic-children counts are the list lengths.
 
 ## Ticket selection (`selectAssignment()`)
 

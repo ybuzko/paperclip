@@ -34,6 +34,8 @@ interface FakeIssue {
   status?: string;
   created?: string;
   updated?: string;
+  labels?: string[];
+  openBlockers?: string[];
 }
 
 interface FakeJiraScript {
@@ -63,6 +65,8 @@ function toIssues(value: number | FakeIssue[], prefix: string, status: string, i
     parentKey: null,
     created: issue.created ?? null,
     updated: issue.updated ?? null,
+    labels: issue.labels ?? [],
+    openBlockers: issue.openBlockers ?? [],
   }));
 }
 
@@ -97,6 +101,8 @@ function fakeJiraFactory(script: FakeJiraScript): {
         parentKey,
         created: null,
         updated: null,
+        labels: [],
+        openBlockers: [],
       }));
     }
     return [];
@@ -649,6 +655,75 @@ describeEmbeddedPostgres("fleet dispatch service (embedded postgres)", () => {
       const lastDecision = rows[0]?.lastDecision as { assignment?: { key: string }; nudgedAssignment?: { key: string } };
       expect(lastDecision.assignment?.key).toBe("FT-3");
       expect(lastDecision.nudgedAssignment?.key).toBe("FT-3");
+    });
+
+    it("never selects a blocked task: unresolved blockers and the blocked label are skipped, and the skip is recorded", async () => {
+      const companyId = await seedCompany();
+      const leadAgentId = await seedLeadAgent(companyId);
+      await seedProject(companyId, leadAgentId);
+      await seedJiraSettings({ human: true });
+      await seedEnforceMode();
+      await seedGreenGovernor(NOW, { state: "OPEN" });
+
+      const jira = fakeJiraFactory({
+        readyTasks: [
+          // Oldest, would win on age, but is blocked by an unresolved issue.
+          { key: "SEEN-284", status: "To Do", created: "2025-01-01T00:00:00.000Z", openBlockers: ["SEEN-300"] },
+          // Labelled blocked.
+          { key: "SEEN-291", status: "To Do", created: "2025-02-01T00:00:00.000Z", labels: ["family-ask", "Blocked"] },
+          // Workable.
+          { key: "SEEN-288", status: "To Do", created: "2025-03-01T00:00:00.000Z", labels: ["agent-ready"] },
+        ],
+        epicsToExplode: 0,
+        closeCandidateKeys: [],
+        unfinishedParentKeys: [],
+      });
+      const wakeup = fakeWakeup();
+      const svc = createFleetDispatchService({ db, logger: fakeLogger(), jira: jira.factory, wakeup: wakeup.fn, now: () => NOW });
+
+      const result = await svc.tick();
+
+      expect(result.projects[0]?.nudged).toBe(true);
+      const payload = wakeup.calls[0]?.opts.payload as { fleetDispatch: Record<string, unknown> };
+      expect(payload.fleetDispatch).toMatchObject({
+        assignment: { key: "SEEN-288", kind: "task" },
+        readyTasks: 1,
+      });
+      const rows = await db.select().from(fleetDispatchState);
+      expect(rows[0]?.readyTasks).toBe(1);
+      const lastDecision = rows[0]?.lastDecision as { blockedKeys?: string[] };
+      expect(lastDecision.blockedKeys).toEqual(["SEEN-284", "SEEN-291"]);
+    });
+
+    it("reports no work, naming the blocked count, when every assigned task is blocked", async () => {
+      const companyId = await seedCompany();
+      const leadAgentId = await seedLeadAgent(companyId);
+      await seedProject(companyId, leadAgentId);
+      await seedJiraSettings({ human: true });
+      await seedEnforceMode();
+      await seedGreenGovernor(NOW, { state: "OPEN" });
+
+      const jira = fakeJiraFactory({
+        readyTasks: [
+          { key: "SEEN-284", status: "To Do", openBlockers: ["SEEN-300"] },
+          { key: "SEEN-285", status: "To Do", labels: ["blocked"], openBlockers: ["SEEN-281", "SEEN-284"] },
+        ],
+        epicsToExplode: 0,
+        closeCandidateKeys: [],
+        unfinishedParentKeys: [],
+      });
+      const wakeup = fakeWakeup();
+      const svc = createFleetDispatchService({ db, logger: fakeLogger(), jira: jira.factory, wakeup: wakeup.fn, now: () => NOW });
+
+      const result = await svc.tick();
+
+      expect(result.projects[0]?.nudged).toBe(false);
+      expect(wakeup.calls).toHaveLength(0);
+      const rows = await db.select().from(fleetDispatchState);
+      expect(rows[0]?.readyTasks).toBe(0);
+      const lastDecision = rows[0]?.lastDecision as { reason?: string; blockedKeys?: string[] };
+      expect(lastDecision.reason).toBe("no_work: no workable tasks, epics to explode, or epics to close (2 assigned tasks blocked)");
+      expect(lastDecision.blockedKeys).toEqual(["SEEN-284", "SEEN-285"]);
     });
 
     it("selects an epic to close before an epic to explode when no tasks are ready", async () => {

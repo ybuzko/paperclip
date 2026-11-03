@@ -264,7 +264,7 @@ describe("jira-client", () => {
     it("requests summary/created/updated by default and maps them", async () => {
       const stub = await startStub({
         searchJql: (_req, url, res) => {
-          expect(url.searchParams.get("fields")).toBe("key,summary,status,issuetype,created,updated,parent");
+          expect(url.searchParams.get("fields")).toBe("key,summary,status,issuetype,created,updated,parent,labels,issuelinks");
           json(res, 200, {
             issues: [
               {
@@ -293,8 +293,53 @@ describe("jira-client", () => {
           statusName: "In Progress",
           statusCategoryKey: "indeterminate",
           parentKey: null,
+          labels: [],
+          openBlockers: [],
         },
       ]);
+      await stub.close();
+    });
+
+    it("maps labels and keeps only unresolved 'is blocked by' links as open blockers", async () => {
+      const stub = await startStub({
+        searchJql: (_req, _url, res) => {
+          json(res, 200, {
+            issues: [
+              {
+                key: "SEEN-285",
+                fields: {
+                  summary: "Onboard family libraries",
+                  issuetype: { name: "Task" },
+                  status: { name: "To Do", statusCategory: { key: "new" } },
+                  labels: ["blocked", "family-ask", 42],
+                  issuelinks: [
+                    // Unresolved blocker: counts.
+                    { type: { name: "Blocks", inward: "is blocked by", outward: "blocks" },
+                      inwardIssue: { key: "SEEN-281", fields: { status: { name: "To Do", statusCategory: { key: "new" } } } } },
+                    // "Done" in a workflow whose Done sits in the indeterminate category: resolved by name.
+                    { type: { name: "Blocks", inward: "is blocked by", outward: "blocks" },
+                      inwardIssue: { key: "SEEN-277", fields: { status: { name: "Done", statusCategory: { key: "indeterminate" } } } } },
+                    // Resolved by category.
+                    { type: { name: "Blocks", inward: "is blocked by", outward: "blocks" },
+                      inwardIssue: { key: "SEEN-280", fields: { status: { name: "Finished", statusCategory: { key: "done" } } } } },
+                    // Outward side: this issue blocks another; not a blocker of this one.
+                    { type: { name: "Blocks", inward: "is blocked by", outward: "blocks" },
+                      outwardIssue: { key: "SEEN-295", fields: { status: { name: "To Do", statusCategory: { key: "new" } } } } },
+                    // Unrelated link type.
+                    { type: { name: "Relates", inward: "relates to", outward: "relates to" },
+                      inwardIssue: { key: "SEEN-1", fields: { status: { name: "To Do", statusCategory: { key: "new" } } } } },
+                  ],
+                },
+              },
+            ],
+            isLast: true,
+          });
+        },
+      });
+      const client = createJiraClient({ baseUrl: stub.url, email: EMAIL, apiToken: API_TOKEN });
+      const [issue] = await client.searchIssues("project = SEEN");
+      expect(issue?.labels).toEqual(["blocked", "family-ask"]);
+      expect(issue?.openBlockers).toEqual(["SEEN-281"]);
       await stub.close();
     });
   });

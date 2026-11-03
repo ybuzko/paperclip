@@ -7,12 +7,15 @@ import {
   decideDispatch,
   epicsToCloseCandidateJql,
   epicsToExplodeJql,
+  isBlockedCandidate,
   jqlQuote,
   parseFleetAck,
+  partitionBlocked,
   readyTasksJql,
   selectAssignment,
-  unfinishedChildrenJql,
   type DecideDispatchInput,
+  type ReadyIssueCandidate,
+  unfinishedChildrenJql,
 } from "./dispatch-policy.js";
 
 describe("jqlQuote", () => {
@@ -446,6 +449,56 @@ describe("parseFleetAck", () => {
     expect(parseFleetAck("fleet-ack: worked=FT-1 kind=bogus outcome=done")).toBeNull();
     expect(parseFleetAck(null)).toBeNull();
     expect(parseFleetAck("")).toBeNull();
+  });
+});
+
+describe("isBlockedCandidate / partitionBlocked", () => {
+  const c = (key: string, extra: Partial<ReadyIssueCandidate> = {}): ReadyIssueCandidate => ({
+    key, summary: key, statusName: "To Do", created: null, updated: null, ...extra,
+  });
+
+  it("treats an unresolved 'is blocked by' link as blocked", () => {
+    expect(isBlockedCandidate(c("SEEN-284", { openBlockers: ["SEEN-300"] }))).toBe(true);
+  });
+
+  it("treats the blocked label as blocked, any case", () => {
+    expect(isBlockedCandidate(c("SEEN-291", { labels: ["family-ask", "Blocked"] }))).toBe(true);
+  });
+
+  it("is not blocked without links or label, including when the fields are absent", () => {
+    expect(isBlockedCandidate(c("SEEN-288", { labels: ["agent-ready"], openBlockers: [] }))).toBe(false);
+    expect(isBlockedCandidate(c("SEEN-289"))).toBe(false);
+  });
+
+  it("partitions in order and keeps both halves", () => {
+    const { workable, blocked } = partitionBlocked([
+      c("SEEN-284", { openBlockers: ["SEEN-300"] }),
+      c("SEEN-288"),
+      c("SEEN-291", { labels: ["blocked"] }),
+      c("SEEN-289"),
+    ]);
+    expect(workable.map((x) => x.key)).toEqual(["SEEN-288", "SEEN-289"]);
+    expect(blocked.map((x) => x.key)).toEqual(["SEEN-284", "SEEN-291"]);
+  });
+});
+
+describe("decideDispatch no_work reason with blocked tasks", () => {
+  it("says how many assigned tasks were excluded as blocked", () => {
+    const result = decideDispatch({
+      governor: { state: "OPEN", stale: false, fiveHourPct: 0, floor5h: 80 },
+      projectClass: "P2",
+      counts: { readyTasks: 0, epicsToExplode: 0, epicsToClose: 0 },
+      blockedTasks: 7,
+      agentBusy: false,
+      lastNudgeAt: null,
+      backoffLevel: 0,
+      lastAckAt: null,
+      lastAckOutcome: null,
+      now: new Date("2026-11-03T00:00:00Z"),
+      previousCountsFingerprint: null,
+    });
+    expect(result.nudge).toBe(false);
+    expect(result.reason).toBe("no_work: no workable tasks, epics to explode, or epics to close (7 assigned tasks blocked)");
   });
 });
 
